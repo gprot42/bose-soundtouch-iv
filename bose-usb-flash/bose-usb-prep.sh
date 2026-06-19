@@ -637,8 +637,8 @@ extract_update_stu() {
     step "Extracting $FIRMWARE_FILENAME" >&2
     info "Zip: $zip" >&2
     if $DRY_RUN; then dr "unzip -j \"$zip\" \"*$FIRMWARE_FILENAME\" -d \"$dest_dir\"" >&2; echo "$out"; return; fi
-    unzip -j -o "$zip" "*$FIRMWARE_FILENAME" -d "$dest_dir" 2>/dev/null \
-        || unzip -j -o "$zip" "$FIRMWARE_FILENAME" -d "$dest_dir" 2>/dev/null || true
+    unzip -j -o "$zip" "*$FIRMWARE_FILENAME" -d "$dest_dir" >/dev/null 2>&1 \
+        || unzip -j -o "$zip" "$FIRMWARE_FILENAME" -d "$dest_dir" >/dev/null 2>&1 || true
     if [[ ! -f "$out" ]]; then
         warn "Contents of zip:" >&2; unzip -l "$zip" | head -20 >&2
         fatal "$FIRMWARE_FILENAME not found in zip — file may be corrupted. Re-download and retry."
