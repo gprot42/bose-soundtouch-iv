@@ -776,6 +776,10 @@ main() {
     # SSH
     $MODE_SSH && write_ssh_trigger "$mp"
 
+    # Clean junk a second time — macOS creates ._* and .Spotlight-V100 when
+    # writing files to a FAT32 volume, so we must clean after all writes.
+    clean_macos_junk "$mp"
+
     # Verify
     verify_usb_contents "$mp"
 
