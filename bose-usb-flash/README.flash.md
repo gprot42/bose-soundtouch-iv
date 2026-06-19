@@ -146,52 +146,68 @@ BOSEFLASH/
 
 ## Step 3 — Flash the pedestal
 
-The Wave SoundTouch IV pedestal has a **USB-A port on the back** labelled
-**SETUP B** (next to the Control button and the Bose Link connector).
+> **Important — this is a two-unit system.** The Wave SoundTouch IV is a
+> **Wave console** (top unit: display, numbered buttons 1–6, volume, radio/CD)
+> sitting on a **SoundTouch pedestal** (bottom unit: WiFi/Bluetooth radios,
+> the firmware brain, the USB port, and a single **Control button** on the
+> back), joined by the Bose link cable. **The pedestal is what flashes
+> `Update.stu`.** The console's numbered buttons have nothing to do with the
+> firmware update.
 
-> **Which port?** The pedestal has two USB connections: a Micro-USB port
-> (for the old computer-updater method — now broken since Bose's servers
-> shut down) and a **USB-A port labelled SETUP B** for a USB drive.
-> Use the **USB-A SETUP B port only**.
+The firmware USB port is on the **pedestal**, labelled **SETUP / SETUP B /
+SERVICE** (next to the Control button and the Bose link connector).
 
-> **Critical:** The pedestal does **NOT** auto-detect `Update.stu` on
-> a normal power-on. You must force it into firmware-update mode using
-> the button sequence below. Powering on normally (even with the USB
-> inserted) will simply boot to `SOUNDTOUCH NOT CONFIGURED` — the update
-> will be silently ignored.
+> **Which port?** Use the jack labelled **SETUP / SETUP B / SERVICE** only —
+> not the network/computer-setup port. Some pedestal revisions use a
+> **Micro-USB** SETUP jack, which needs a USB-A-female → Micro-USB-male
+> adapter for a standard USB stick.
 
-### Procedure
+> **Do NOT use the "Button 4 + Volume Down" sequence.** That is the procedure
+> for **standalone SoundTouch 10/20/30 speakers**, where the USB port and the
+> numbered buttons are on the same unit. On the Wave SoundTouch IV those
+> buttons are on the console and do not drive the pedestal — holding them
+> just boots normally to `SOUNDTOUCH NOT CONFIGURED`.
 
-1. **Unplug the AC power cord** from the pedestal completely (do not use
-   standby — full mains power-off).
-2. **Insert the USB stick** into the **SETUP B (USB-A)** port on the back.
-3. **Hold Button 4 + Volume Down (−)** simultaneously — keep holding.
-4. While still holding those two buttons, **plug the AC power cord back in**.
-5. Keep holding until the display shows a **circle-slash (⊘ prohibited
-   hand) symbol**, then release both buttons.
-6. **Do not touch anything** while the update runs. This takes 2–5 minutes.
-   The display may show a progress bar, "UPDATE", "PLEASE WAIT", or go blank.
-7. The pedestal **reboots automatically** when complete. Remove the USB stick.
+### Method 1 — auto-flash (primary, no buttons)
+
+1. Leave the system **powered ON**.
+2. **Insert the USB stick** into the pedestal's **SETUP / SETUP B / SERVICE**
+   jack (use a Micro-USB adapter if that jack is Micro-USB).
+3. Wait **30 seconds to a few minutes**. The pedestal **reboots on its own**
+   when the flash completes — that is the success signal.
+4. **Do not touch the console's numbered buttons.**
+
+### Method 2 — pedestal Control button (fallback)
+
+If Method 1 produces no reboot:
+
+1. **Unplug the AC power cord** completely.
+2. **Insert the USB** into the SETUP / SETUP B / SERVICE jack.
+3. Press and **hold the Control button on the BACK of the pedestal**.
+4. While still holding, **reconnect AC power**. Keep holding ~5 seconds,
+   then release.
+5. Wait up to 5 minutes — the pedestal reboots automatically when done.
 
 ### Signs the flash is working
 
-- Display shows the circle-slash ⊘ symbol immediately after the button sequence
-- Display transitions to a progress bar, "UPDATE", or "PLEASE WAIT"
-- WiFi light blinks during the process
-- Pedestal reboots on its own at the end
+- Pedestal **WiFi LED blinks white** (it is reading/processing the USB)
+- Display may show a progress bar, "UPDATE", or "PLEASE WAIT", or go blank
+- Pedestal **reboots on its own** after ~30 s to a few minutes
 
 ### Signs something went wrong
 
-- **`SOUNDTOUCH NOT CONFIGURED`** appears with USB inserted → the pedestal
-  booted normally; the button sequence was not used or not held long enough —
-  power off completely and retry from step 1
-- Nothing happens after 60 seconds after the circle-slash appears → the
-  `Update.stu` file may be corrupted; re-run `bose-usb-prep.sh` to
-  re-download and re-verify
-- Display shows an error code → try the previous firmware version
+- **`SOUNDTOUCH NOT CONFIGURED`** appears and nothing else happens → the
+  pedestal booted normally without reading the USB. Most common causes:
+  wrong jack (use SETUP/SETUP B/SERVICE, add a Micro-USB adapter if needed),
+  macOS junk files on the stick (re-run `bose-usb-prep.sh`), or the drive
+  is not being enumerated — try a different small USB 2.0 drive
+- **WiFi LED never changes** → the stick is not being read at all; recheck
+  the jack, FAT32 format, and try another drive
+- **LED blinks white 3× then goes amber** → the USB was read but the
+  firmware was rejected; try the previous firmware version
   (`./bose-usb-prep.sh --version 27.00.03`, then `26.00.01`)
 - Pedestal reboots into the same stuck state → try the previous firmware
-  version and repeat the full button-sequence procedure
+  version and repeat the procedure
 
 ---
 
@@ -323,15 +339,15 @@ config without re-inserting the USB each time.
 
 | Stage | What to see | What to do next |
 |-------|------------|-----------------|
-| Before flash | AP broadcasts, DHCP works, port 80 refused | Prepare USB with `bose-usb-prep.sh`, use button sequence |
-| Entering update mode | Circle-slash ⊘ on display | Release buttons, wait for update to start |
-| Flash in progress | Progress bar / "UPDATE" / WiFi light blinks | Wait, do not unplug |
-| Flash complete | Pedestal reboots automatically | Remove USB, hold Control ~3 s for setup mode |
+| Before flash | AP broadcasts, DHCP works, port 80 refused | Prepare USB with `bose-usb-prep.sh` |
+| Inserting USB | Pedestal WiFi LED blinks white | Insert in SETUP/SETUP B/SERVICE jack, leave it |
+| Flash in progress | Progress bar / "UPDATE" / WiFi LED blinks | Wait, do not unplug |
+| Flash complete | Pedestal reboots automatically (~30 s–5 min) | Remove USB, hold Control ~3 s for setup mode |
 | Setup mode OK | Solid amber + `SETUP SEE INSTRUCTIONS` | Join Bose AP, open BosMan, enter home WiFi |
 | On home WiFi | Bose AP disappears | Open BosMan, search devices |
 | Cloud dead | Presets / TuneIn broken | Set up SoundCork |
 | SoundCork running | Presets resolve, streaming works | Done |
-| **Wrong — normal boot** | `SOUNDTOUCH NOT CONFIGURED` with USB in | Button sequence not used — power off and retry |
+| **Wrong — USB ignored** | `SOUNDTOUCH NOT CONFIGURED`, no reboot | Check SETUP jack/adapter, FAT32, junk files, try another drive; do NOT use console buttons |
 
 ---
 
