@@ -54,6 +54,8 @@ MAX_SIZE_GB=32
 FIRMWARE_FILENAME="Update.stu"
 SSH_TRIGGER_FILE="remote_services"
 LATEST_ZIP="Bluetooth_WST4_Update_ti_27.00.06.46330.5043500.nelson.sm2.zip"
+MIN_STU_SIZE_BYTES=$((10 * 1024 * 1024))
+MAX_STU_SIZE_BYTES=$((1024 * 1024 * 1024))
 
 declare -a KNOWN_VERSIONS=(
     "27.00.06:Bluetooth_WST4_Update_ti_27.00.06.46330.5043500.nelson.sm2.zip"
@@ -156,6 +158,7 @@ check_cmd() {
 }
 check_cmd curl  "install curl  (brew install curl)"
 check_cmd unzip "install unzip (brew install unzip)"
+check_cmd stat  "built-in on macOS/Linux"
 if [[ "$OS" == macos ]]; then
     check_cmd diskutil "built-in on macOS"
     check_cmd awk      "built-in on macOS"
@@ -175,6 +178,37 @@ resolve_firmware_zip() {
         [[ "${e%%:*}" == "$ver" ]] && { echo "${e##*:}"; return 0; }
     done
     fatal "Unknown version: $ver  (run --list-versions to see valid values)"
+}
+
+file_size_bytes() {
+    local path="$1"
+    if [[ "$OS" == macos ]]; then
+        stat -f%z "$path" 2>/dev/null || echo 0
+    else
+        stat -c%s "$path" 2>/dev/null || echo 0
+    fi
+}
+
+validate_update_stu_file() {
+    local stu="$1" label="${2:-$FIRMWARE_FILENAME}"
+    [[ -f "$stu" ]] || fatal "$label not found: $stu"
+    local size
+    size=$(file_size_bytes "$stu")
+    (( size >= MIN_STU_SIZE_BYTES )) || fatal "$label is too small ($(du -sh "$stu" | cut -f1)); firmware file may be incomplete."
+    (( size <= MAX_STU_SIZE_BYTES )) || fatal "$label is unexpectedly large ($(du -sh "$stu" | cut -f1)); refusing to write suspicious firmware."
+    ok "$label size sanity check passed ($(du -sh "$stu" | cut -f1))" >&2
+}
+
+validate_zip_archive() {
+    local zip="$1" entry found=false
+    step "Validating firmware archive" >&2
+    [[ -f "$zip" ]] || fatal "Firmware zip not found: $zip"
+    unzip -tq "$zip" >/dev/null 2>&1 || fatal "Firmware zip failed integrity test — re-download and retry."
+    while IFS= read -r entry; do
+        [[ "${entry##*/}" == "$FIRMWARE_FILENAME" ]] && { found=true; break; }
+    done < <(unzip -Z1 "$zip" 2>/dev/null || true)
+    $found || fatal "$FIRMWARE_FILENAME not found in firmware zip."
+    ok "Zip integrity check passed and contains $FIRMWARE_FILENAME" >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -593,6 +627,33 @@ get_mount_point() {
     echo "$tmp"
 }
 
+validate_usb_format() {
+    local disk="$1" mp="$2"
+    step "Validating USB format"
+    if $DRY_RUN; then dr "confirm MBR/FAT32/label/root files on $mp"; return; fi
+    if [[ "$OS" == macos ]]; then
+        local disk_info volume_info
+        disk_info=$(diskutil info "$disk" 2>/dev/null)
+        volume_info=$(diskutil info "$mp" 2>/dev/null)
+        echo "$disk_info" | grep -qiE 'Partition Map Scheme:[[:space:]]+Master Boot Record|FDisk_partition_scheme|MBR' \
+            || fatal "USB partition map is not MBR/FDisk. Bose units are most reliable with MBR + FAT32."
+        echo "$volume_info" | grep -qiE 'File System Personality:[[:space:]]+MS-DOS FAT32|Type \(Bundle\):[[:space:]]+msdos' \
+            || fatal "USB filesystem is not FAT32/MS-DOS."
+        echo "$volume_info" | grep -q "Volume Name:.*$VOLUME_LABEL" \
+            || warn "USB label is not reported as $VOLUME_LABEL; continuing because mount point is $mp."
+    else
+        local part="/dev/${disk}1"
+        local fstype label pttype
+        fstype=$(lsblk -no FSTYPE "$part" 2>/dev/null | tr -d ' ')
+        label=$(lsblk -no LABEL "$part" 2>/dev/null | tr -d ' ')
+        pttype=$(lsblk -no PTTYPE "/dev/$disk" 2>/dev/null | tr -d ' ')
+        [[ "$pttype" == dos ]] || fatal "USB partition table is not MBR/dos."
+        [[ "$fstype" == vfat ]] || fatal "USB filesystem is not FAT32/vfat."
+        [[ "$label" == "$VOLUME_LABEL" ]] || warn "USB label is '$label', expected '$VOLUME_LABEL'."
+    fi
+    ok "USB format looks Bose-compatible: MBR + FAT32"
+}
+
 # ---------------------------------------------------------------------------
 # macOS junk file removal  [safety check 5]
 # ---------------------------------------------------------------------------
@@ -637,12 +698,14 @@ extract_update_stu() {
     step "Extracting $FIRMWARE_FILENAME" >&2
     info "Zip: $zip" >&2
     if $DRY_RUN; then dr "unzip -j \"$zip\" \"*$FIRMWARE_FILENAME\" -d \"$dest_dir\"" >&2; echo "$out"; return; fi
+    validate_zip_archive "$zip"
     unzip -j -o "$zip" "*$FIRMWARE_FILENAME" -d "$dest_dir" >/dev/null 2>&1 \
         || unzip -j -o "$zip" "$FIRMWARE_FILENAME" -d "$dest_dir" >/dev/null 2>&1 || true
     if [[ ! -f "$out" ]]; then
         warn "Contents of zip:" >&2; unzip -l "$zip" | head -20 >&2
         fatal "$FIRMWARE_FILENAME not found in zip — file may be corrupted. Re-download and retry."
     fi
+    validate_update_stu_file "$out" "Extracted $FIRMWARE_FILENAME"
     ok "Extracted $FIRMWARE_FILENAME ($(du -sh "$out" | cut -f1))" >&2
     echo "$out"
 }
@@ -654,12 +717,15 @@ write_firmware() {
     local src="$1" mp="$2" dst="$2/$FIRMWARE_FILENAME"
     step "Writing $FIRMWARE_FILENAME to USB"
     if $DRY_RUN; then dr "cp + md5 verify \"$src\" → \"$dst\""; return; fi
+    validate_update_stu_file "$src" "Source $FIRMWARE_FILENAME"
     cp "$src" "$dst" || fatal "cp failed — disk may be full or read-only."
+    sync
     local s d
     if   command -v md5sum &>/dev/null; then s=$(md5sum "$src"|cut -d' ' -f1); d=$(md5sum "$dst"|cut -d' ' -f1)
     elif command -v md5     &>/dev/null; then s=$(md5 -q "$src"); d=$(md5 -q "$dst")
     else warn "md5 not available — skipping checksum."; s=skip; d=skip; fi
     [[ "$s" == "$d" ]] || fatal "SAFETY [4]: Checksum mismatch after copy. Disk may be faulty."
+    validate_update_stu_file "$dst" "USB $FIRMWARE_FILENAME"
     ok "$FIRMWARE_FILENAME written and verified  (md5: $d)"
 }
 
@@ -703,6 +769,17 @@ verify_usb_contents() {
     $junk && warn "Hidden/junk files remain — they may prevent the pedestal detecting the firmware."
     $MODE_FLASH && [[ ! -f "$mp/$FIRMWARE_FILENAME" ]] && fatal "$FIRMWARE_FILENAME missing from USB."
     $MODE_SSH   && [[ ! -f "$mp/$SSH_TRIGGER_FILE"  ]] && fatal "$SSH_TRIGGER_FILE missing from USB."
+    $MODE_FLASH && validate_update_stu_file "$mp/$FIRMWARE_FILENAME" "USB $FIRMWARE_FILENAME"
+    local unexpected=false fn
+    while IFS= read -r f; do
+        fn=$(basename "$f")
+        case "$fn" in
+            "$FIRMWARE_FILENAME"|"$SSH_TRIGGER_FILE"|.Spotlight-V100|.fseventsd) ;;
+            *) warn "  [EXTRA] $fn"; unexpected=true ;;
+        esac
+    done < <(find "$mp" -mindepth 1 -maxdepth 1 ! -name '.*' | sort)
+    $unexpected && warn "Extra visible files are present. Bose usually expects only ${FIRMWARE_FILENAME}${MODE_SSH:+ and $SSH_TRIGGER_FILE} at USB root."
+    sync
     ok "USB verification passed"
 }
 
@@ -733,8 +810,8 @@ main() {
     if $MODE_FLASH && [[ -n "$LOCAL_FIRMWARE" ]]; then
         [[ -f "$LOCAL_FIRMWARE" ]] || fatal "Local firmware file not found: $LOCAL_FIRMWARE"
         case "${LOCAL_FIRMWARE##*.}" in
-            stu) stu_path="$LOCAL_FIRMWARE"; info "Using local Update.stu: $stu_path" ;;
-            zip) zip_path="$LOCAL_FIRMWARE"; info "Using local zip: $zip_path" ;;
+            stu) stu_path="$LOCAL_FIRMWARE"; validate_update_stu_file "$stu_path" "Local $FIRMWARE_FILENAME"; info "Using local Update.stu: $stu_path" ;;
+            zip) zip_path="$LOCAL_FIRMWARE"; validate_zip_archive "$zip_path"; info "Using local zip: $zip_path" ;;
             *)   fatal "Unrecognised file type: $LOCAL_FIRMWARE  (expected .stu or .zip)" ;;
         esac
     fi
@@ -764,6 +841,9 @@ main() {
         mp=$(get_mount_point "$disk")
         info "Mount point: $mp"
     fi
+
+    # Confirm the resulting USB layout is what older Bose firmware expects.
+    validate_usb_format "$disk" "$mp"
 
     # Clean junk
     clean_macos_junk "$mp"
