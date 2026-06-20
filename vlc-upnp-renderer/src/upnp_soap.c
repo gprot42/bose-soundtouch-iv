@@ -295,16 +295,54 @@ int upnp_av_seek_rel(const char *av_control, const char *target_hms)
                           NULL, 0);
 }
 
+static void soap_strip_namespaces(char *xml)
+{
+    for (char *p = xml; *p != '\0'; p++)
+    {
+        if (*p != '<' || p[1] == '/' || p[1] == '?')
+            continue;
+
+        char *colon = strchr(p + 1, ':');
+        char *gt = strchr(p + 1, '>');
+        if (colon != NULL && gt != NULL && colon < gt)
+        {
+            size_t tail = strlen(colon + 1) + 1;
+            memmove(p + 1, colon + 1, tail);
+        }
+    }
+}
+
+static const char *soap_body_start(const char *response)
+{
+    if (response == NULL)
+        return NULL;
+
+    const char *body = strstr(response, "\r\n\r\n");
+    return body != NULL ? body + 4 : response;
+}
+
 int upnp_soap_parse_tag(const char *xml, const char *tag, char *out, size_t outlen)
 {
     if (xml == NULL || tag == NULL || out == NULL || outlen == 0)
         return -1;
 
+    const char *body = soap_body_start(xml);
+    char scratch[4096];
+    const char *parse_xml = body;
+
+    if (body != NULL)
+    {
+        strncpy(scratch, body, sizeof(scratch) - 1);
+        scratch[sizeof(scratch) - 1] = '\0';
+        soap_strip_namespaces(scratch);
+        parse_xml = scratch;
+    }
+
     char open[64], close[64];
     snprintf(open, sizeof(open), "<%s>", tag);
     snprintf(close, sizeof(close), "</%s>", tag);
 
-    const char *start = strstr(xml, open);
+    const char *start = strstr(parse_xml, open);
     if (start == NULL)
         return -1;
     start += strlen(open);
