@@ -6,6 +6,7 @@ UPnP/DLNA MediaRenderer) from the command line. No VLC, no extra apps needed.
 Usage
 -----
   python3 send-to-bose.py /path/to/song.mp3        # serve local file, play on Bose
+  python3 send-to-bose.py /path/to/album/          # play all audio files in folder
   python3 send-to-bose.py http://host/stream.mp3   # direct URL — no server needed
   python3 send-to-bose.py --stop                   # stop current playback
   python3 send-to-bose.py --status                 # show transport state
@@ -16,8 +17,9 @@ How it works
 ------------
 1. Discovers the Bose via SSDP (M-SEARCH for MediaRenderer:1) — takes ~3 s.
    Skip discovery with --ip if you know the UPnP port (usually 8091).
-2. For local files: starts a temporary HTTP server on a random high port so the
-   Bose can fetch the file directly from your Mac.
+2. For local files or folders: starts a temporary HTTP server on a random high
+   port so the Bose can fetch files directly from your Mac. Folders play in
+   sorted filename order, one track after another.
 3. Sends a SOAP SetAVTransportURI call, then a Play call, to the Bose
    AVTransport endpoint.
 4. Waits for Ctrl+C, then sends Stop and shuts down the local server.
@@ -38,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from typing import Callable
 
 # ── SSDP ──────────────────────────────────────────────────────────────────────
 
@@ -45,6 +48,10 @@ SSDP_ADDR = "239.255.255.250"
 SSDP_PORT = 1900
 SSDP_MX   = 3          # seconds for devices to reply
 ST_RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
+
+AUDIO_EXTENSIONS = {
+    ".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma",
+}
 
 
 def ssdp_discover(timeout: float = SSDP_MX + 1) -> list[dict]:
@@ -198,7 +205,20 @@ def rc_soap(rc_ctrl: str, action: str, args: str = "") -> str | None:
     return soap(rc_ctrl, RC_SVC, action, args)
 
 
-# ── Local HTTP server (serves one file) ───────────────────────────────────────
+# ── Local media paths ───────────────────────────────────────────────────────────
+
+def list_audio_files(folder_path: str) -> list[str]:
+    """Return absolute paths to playable audio files in folder_path (non-recursive)."""
+    folder = os.path.abspath(folder_path)
+    files = []
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in AUDIO_EXTENSIONS:
+            files.append(path)
+    return files
+
+
+# ── Local HTTP server ───────────────────────────────────────────────────────────
 
 def local_ip_toward(dest_ip: str) -> str:
     """Return the local IP the OS would use to reach dest_ip."""
@@ -210,19 +230,39 @@ def local_ip_toward(dest_ip: str) -> str:
         s.close()
 
 
-class _SingleFileHandler(http.server.BaseHTTPRequestHandler):
-    """Serve a single file regardless of URL path."""
+class _MediaHandler(http.server.BaseHTTPRequestHandler):
+    """Serve files from serve_dir; single-file mode also accepts any URL path."""
 
-    file_path: str = ""   # set before starting server
+    serve_dir: str = ""
+    single_file: str | None = None
+
+    def _resolve_path(self) -> str | None:
+        if self.single_file:
+            return self.single_file
+
+        rel = urllib.parse.unquote(urllib.parse.urlparse(self.path).path).lstrip("/")
+        if not rel or rel == "..":
+            return None
+
+        base = os.path.abspath(self.serve_dir)
+        file_path = os.path.normpath(os.path.join(base, rel))
+        if not file_path.startswith(base + os.sep):
+            return None
+        return file_path if os.path.isfile(file_path) else None
 
     def do_GET(self):
+        file_path = self._resolve_path()
+        if not file_path:
+            self.send_error(404)
+            return
+
         try:
-            size = os.path.getsize(self.file_path)
+            size = os.path.getsize(file_path)
         except OSError:
             self.send_error(404)
             return
 
-        mime, _ = mimetypes.guess_type(self.file_path)
+        mime, _ = mimetypes.guess_type(file_path)
         if not mime:
             mime = "application/octet-stream"
 
@@ -233,7 +273,7 @@ class _SingleFileHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection",     "close")
         self.end_headers()
         try:
-            with open(self.file_path, "rb") as fh:
+            with open(file_path, "rb") as fh:
                 self.wfile.write(fh.read())
         except (OSError, BrokenPipeError):
             pass
@@ -242,16 +282,32 @@ class _SingleFileHandler(http.server.BaseHTTPRequestHandler):
         pass   # suppress access log
 
 
-def start_file_server(file_path: str, bose_ip: str) -> tuple[str, http.server.HTTPServer]:
-    """Start a temporary HTTP server; return (media_url, httpd)."""
-    _SingleFileHandler.file_path = file_path
-    httpd = http.server.HTTPServer(("0.0.0.0", 0), _SingleFileHandler)
+def start_media_server(
+    bose_ip: str,
+    *,
+    file_path: str | None = None,
+    dir_path: str | None = None,
+) -> tuple[http.server.HTTPServer, str, Callable[[str], str]]:
+    """Start a temporary HTTP server; return (httpd, base_url, url_for_file)."""
+    if bool(file_path) == bool(dir_path):
+        raise ValueError("Provide exactly one of file_path or dir_path")
+
+    _MediaHandler.single_file = os.path.abspath(file_path) if file_path else None
+    _MediaHandler.serve_dir = os.path.abspath(dir_path or os.path.dirname(file_path))
+    httpd = http.server.HTTPServer(("0.0.0.0", 0), _MediaHandler)
     port  = httpd.server_address[1]
     my_ip = local_ip_toward(bose_ip)
-    fname = urllib.parse.quote(os.path.basename(file_path))
-    url   = f"http://{my_ip}:{port}/{fname}"
+    base  = f"http://{my_ip}:{port}"
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return url, httpd
+
+    def url_for_file(path: str) -> str:
+        if file_path:
+            fname = urllib.parse.quote(os.path.basename(path))
+            return f"{base}/{fname}"
+        rel = os.path.relpath(os.path.abspath(path), _MediaHandler.serve_dir)
+        return f"{base}/{urllib.parse.quote(rel)}"
+
+    return httpd, base, url_for_file
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -286,6 +342,52 @@ def cmd_status(device: dict):
         print(f"URI   : {uri}")
 
 
+def get_transport_state(device: dict) -> str | None:
+    resp = av_soap(device["av_ctrl"], "GetTransportInfo",
+                   "<InstanceID>0</InstanceID>")
+    if not resp:
+        return None
+    root = ET.fromstring(resp)
+    for el in root.iter():
+        el.tag = el.tag.split("}")[-1]
+    return getattr(root.find(".//CurrentTransportState"), "text", None)
+
+
+def play_uri(device: dict, media_url: str) -> bool:
+    r = av_soap(
+        device["av_ctrl"], "SetAVTransportURI",
+        f"<InstanceID>0</InstanceID>"
+        f"<CurrentURI>{media_url}</CurrentURI>"
+        f"<CurrentURIMetaData></CurrentURIMetaData>",
+    )
+    if r is None:
+        return False
+    time.sleep(0.5)
+    r = av_soap(device["av_ctrl"], "Play",
+                "<InstanceID>0</InstanceID><Speed>1</Speed>")
+    return r is not None
+
+
+def wait_for_playback_start(device: dict, timeout: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if get_transport_state(device) == "PLAYING":
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def wait_for_track_end(device: dict, poll: float = 2.0) -> None:
+    """Block until the current track finishes, or raise KeyboardInterrupt."""
+    if not wait_for_playback_start(device):
+        return
+    while True:
+        state = get_transport_state(device)
+        if state in ("STOPPED", "NO_MEDIA_PRESENT", None):
+            return
+        time.sleep(poll)
+
+
 def cmd_volume(device: dict, level: int):
     if not device.get("rc_ctrl"):
         print("No RenderingControl endpoint found.", file=sys.stderr)
@@ -300,43 +402,53 @@ def cmd_volume(device: dict, level: int):
 def cmd_play(device: dict, source: str):
     bose_host = urllib.parse.urlparse(device["location"]).hostname
 
-    # Serve local file if needed
     httpd = None
+    tracks: list[tuple[str, str]] = []   # (label, media_url)
+
     if source.startswith("http://") or source.startswith("https://"):
-        media_url = source
+        tracks = [(source, source)]
+    elif os.path.isdir(source):
+        files = list_audio_files(source)
+        if not files:
+            exts = ", ".join(sorted(AUDIO_EXTENSIONS))
+            sys.exit(
+                f"No audio files found in {source}\n"
+                f"Supported extensions: {exts}"
+            )
+        print(f"Serving folder: {os.path.abspath(source)} ({len(files)} tracks)")
+        httpd, _, url_for = start_media_server(bose_host, dir_path=source)
+        tracks = [(os.path.basename(f), url_for(f)) for f in files]
     else:
         if not os.path.isfile(source):
-            sys.exit(f"File not found: {source}")
+            sys.exit(f"Not found: {source}")
         print(f"Serving : {source}")
-        media_url, httpd = start_file_server(os.path.abspath(source), bose_host)
-        print(f"URL     : {media_url}")
+        httpd, _, url_for = start_media_server(bose_host, file_path=source)
+        tracks = [(os.path.basename(source), url_for(source))]
+        print(f"URL     : {tracks[0][1]}")
 
     print(f"Renderer: {device['friendly_name']}  ({device['av_ctrl']})")
-    print(f"Setting URI ...")
-    r = av_soap(
-        device["av_ctrl"], "SetAVTransportURI",
-        f"<InstanceID>0</InstanceID>"
-        f"<CurrentURI>{media_url}</CurrentURI>"
-        f"<CurrentURIMetaData></CurrentURIMetaData>",
-    )
-    if r is None:
-        if httpd:
-            httpd.shutdown()
-        sys.exit("SetAVTransportURI failed — check device IP and port.")
 
-    time.sleep(0.5)
-    print("Sending Play ...")
-    r = av_soap(device["av_ctrl"], "Play",
-                "<InstanceID>0</InstanceID><Speed>1</Speed>")
-    if r is None:
-        if httpd:
-            httpd.shutdown()
-        sys.exit("Play command failed.")
-
-    print("Playing. Press Ctrl+C to stop.\n")
     try:
-        while True:
-            time.sleep(2)
+        for i, (label, media_url) in enumerate(tracks, 1):
+            if len(tracks) > 1:
+                print(f"\n[{i}/{len(tracks)}] {label}")
+                print(f"URL: {media_url}")
+            else:
+                print("Setting URI ...")
+
+            if not play_uri(device, media_url):
+                sys.exit("Play command failed — check device IP and port.")
+
+            if len(tracks) == 1:
+                print("Playing. Press Ctrl+C to stop.\n")
+                while True:
+                    time.sleep(2)
+            else:
+                print("Playing ...")
+                wait_for_track_end(device)
+
+        if len(tracks) > 1:
+            print("\nFolder finished.")
     except KeyboardInterrupt:
         print("\nStopping ...")
         av_soap(device["av_ctrl"], "Stop",
@@ -417,7 +529,7 @@ def main():
         epilog=__doc__,
     )
     p.add_argument("source", nargs="?",
-                   help="Local file or http(s):// URL to play")
+                   help="Local file, folder, or http(s):// URL to play")
     p.add_argument("--stop",     action="store_true",
                    help="Stop current playback")
     p.add_argument("--status",   action="store_true",

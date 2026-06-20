@@ -1,0 +1,47 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bosman-soundtouch-iv-controller
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: bosman-soundtouch-iv-controller/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Android APK
+        run: npm run build:android
+
+      - name: Create GitHub Release and upload APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ASSET="bosman-v${VERSION}-debug.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk "$ASSET"
+          gh release create "$GITHUB_REF_NAME" \
+            "$ASSET" \
+            --title "BosMan Android v${VERSION}" \
+            --generate-notes

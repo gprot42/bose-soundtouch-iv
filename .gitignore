@@ -1,1 +1,3 @@
 .bluetooth-scan-cache
+__pycache__/
+*.pyc
