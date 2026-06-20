@@ -24,8 +24,11 @@ documented here.
 ## Overview
 
 ```
-1. Get firmware   →  2. Prepare USB   →  3. Flash pedestal   →  4. Setup WiFi   →  5. Replace cloud (SoundCork)
+1. Get firmware   →  2. Prepare USB   →  3. Flash pedestal   →  4. Setup WiFi   →  5. Enable SSH   →  6. SoundCork
 ```
+
+Steps 3 and 5 are **separate pedestal procedures**. Putting both files on one stick
+(`--both`) does not enable SSH during the firmware flash.
 
 ---
 
@@ -80,7 +83,8 @@ https://archive.org/download/bose-soundtouch-software-and-firmware/Firmware/2015
   the pedestal's embedded USB host stack does not parse GPT
 - Filesystem: **FAT32** — not exFAT (pedestal kernel has no exFAT module),
   not NTFS, not FAT16
-- Only **`Update.stu`** at the USB root — no folders, no extra files
+- Firmware flash: only **`Update.stu`** at the USB root — no folders, no extra files
+- SSH enable: only **`remote_services`** at the USB root (see [Flash vs SSH](#flash-vs-ssh-two-separate-procedures))
 
 ### Automated method (recommended)
 
@@ -88,9 +92,49 @@ https://archive.org/download/bose-soundtouch-software-and-firmware/Firmware/2015
 download, extraction, MD5 verify, and format validation — in one command:
 
 ```sh
-./bose-usb-prep.sh          # downloads latest (27.00.06), interactive
-./bose-usb-prep.sh --dry-run  # preview all steps without writing anything
+./bose-usb-prep.sh              # firmware flash only (default)
+./bose-usb-prep.sh --both       # both files on stick — still two pedestal passes
+./bose-usb-prep.sh --ssh        # SSH-only stick (use after flash + WiFi setup)
+./bose-usb-prep.sh --dry-run    # preview all steps without writing anything
 ```
+
+### Flash vs SSH: two separate procedures
+
+`bose-usb-prep.sh --both` writes **`Update.stu`** and **`remote_services`** onto
+the same USB stick. That saves you from preparing two sticks, but it does **not**
+run both operations in one insertion. The pedestal treats them as different
+boot-time behaviors:
+
+| | Firmware flash | SSH enable |
+|---|----------------|------------|
+| **USB file** | `Update.stu` | `remote_services` (empty, no extension) |
+| **When** | Stuck firmware / first recovery | After flash and WiFi setup, before SoundCork |
+| **Power state** | Powered on, or power-cycle + Control button | **Power off** → insert USB → power on |
+| **USB port** | SETUP / SETUP B / SERVICE jack | **Setup B** (USB-A on pedestal back) |
+| **Success signal** | Pedestal reboots on its own | `ssh root@<ip>` connects (port 22 open) |
+| **After** | Remove USB, enter setup mode | `touch /mnt/nv/remote_services` to persist |
+
+**Common mistake:** run `--both`, flash firmware, remove the USB, join home WiFi,
+then try `ssh` — and get `Connection refused`. The flash path processed
+`Update.stu`; `remote_services` was never consumed because you never did the
+SSH power-cycle pass.
+
+**Recommended workflow:**
+
+1. `./bose-usb-prep.sh` or `./bose-usb-prep.sh --both` — flash the pedestal.
+2. Remove USB when the pedestal reboots. Complete WiFi setup (Step 4).
+3. `./bose-usb-prep.sh --ssh` — prepare an **SSH-only** stick (no `Update.stu`).
+4. Power off → insert SSH stick into **Setup B** → power on → wait ~60 s.
+5. `ssh root@<speaker-ip>` then `touch /mnt/nv/remote_services`.
+
+Use `--ssh` for step 3, not the original `--both` stick. If `Update.stu` is still
+on the stick, re-inserting it may trigger another firmware update instead of SSH.
+
+> **Wave IV caveat:** The `remote_services` USB method is documented for SoundTouch
+> speakers and works on many units. Some Wave SoundTouch IV owners report SSH still
+> refusing after the correct procedure ([soundcork#309](https://github.com/deborahgu/soundcork/issues/309)).
+> If that happens, try Ethernet for the SSH boot, a different USB 2.0 stick, and
+> confirm the stick has only `remote_services` with no macOS junk files.
 
 ### Manual method
 
@@ -261,23 +305,36 @@ Summary:
 
 #### 1. Enable SSH on the pedestal (USB method)
 
-Create a **blank file called `remote_services`** (no extension) at the
-root of a clean FAT32 USB stick. On macOS, remove junk files first (same
-commands as Step 2 above). Then:
+This is a **separate procedure** from the firmware flash in Steps 2–4. If you
+used `--both` earlier, that only put both files on the stick — you still need
+this pass after WiFi setup. Prepare an SSH-only stick:
+
+```sh
+./bose-usb-prep.sh --ssh
+```
+
+Or manually: create a **blank file called `remote_services`** (no extension) at
+the root of a clean FAT32 USB stick. On macOS, remove junk files first (same
+commands as Step 2 above). The stick must **not** contain `Update.stu`.
 
 ```
 BOSEFLASH/
 └── remote_services       ← empty file, no extension
 ```
 
-- Power off the pedestal (pull AC cord)
-- Insert the USB stick
-- Power back on and wait ~60 seconds
-- SSH in — no password required:
+Then on the pedestal (speaker must already be on home WiFi):
+
+1. Power off completely (pull AC cord)
+2. Insert the stick into **Setup B** (USB-A jack on the pedestal back)
+3. Power on and wait ~60 seconds
+4. SSH in — no password required:
 
 ```sh
 ssh root@<speaker-ip>
 ```
+
+Use `root@` — `ssh <ip>` alone tries your Mac username and will fail even when
+SSH is running.
 
 Find the speaker's IP from your router's DHCP list or:
 
@@ -345,6 +402,8 @@ config without re-inserting the USB each time.
 | Flash complete | Pedestal reboots automatically (~30 s–5 min) | Remove USB, hold Control ~3 s for setup mode |
 | Setup mode OK | Solid amber + `SETUP SEE INSTRUCTIONS` | Join Bose AP, open BosMan, enter home WiFi |
 | On home WiFi | Bose AP disappears | Open BosMan, search devices |
+| SSH needed | Port 8090 works, port 22 refused | `./bose-usb-prep.sh --ssh`, power-cycle with stick in Setup B |
+| SSH enabled | `ssh root@<ip>` connects | `touch /mnt/nv/remote_services`, then SoundCork setup |
 | Cloud dead | Presets / TuneIn broken | Set up SoundCork |
 | SoundCork running | Presets resolve, streaming works | Done |
 | **Wrong — USB ignored** | `SOUNDTOUCH NOT CONFIGURED`, no reboot | Check SETUP jack/adapter, FAT32, junk files, try another drive; do NOT use console buttons |

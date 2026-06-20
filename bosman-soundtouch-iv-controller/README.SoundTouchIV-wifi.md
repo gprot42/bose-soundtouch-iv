@@ -208,6 +208,7 @@ Bose’s “[Cannot connect to the built‑in setup network](https://support.bos
    - Companion CLI: <https://github.com/timvw/bose>
    - Write‑up: [Keep your Bose SoundTouch alive after the shutdown](https://timvw.be/2026/02/17/keep-your-bose-soundtouch-speaker-alive-after-the-shutdown/)
    - Note: SoundCork enables **passwordless root SSH** via a USB `remote_services` flag file and redirects the speaker’s cloud URLs to your server. Port **8090** already needs no auth. Only do this on a trusted network.
+   - **SSH is a separate USB pass** from firmware flash — `bose-usb-prep.sh --both` does not enable SSH during the flash. See [README.flash.md § Flash vs SSH](../bose-usb-flash/README.flash.md#flash-vs-ssh-two-separate-procedures).
 
 3. **This app (BosMan)** controls the speaker **locally** over port 8090 / WebSocket 8080 and needs none of Bose’s cloud — but the speaker must first be on your Wi‑Fi, which requires the setup server (fix #1) to work at least once.
 

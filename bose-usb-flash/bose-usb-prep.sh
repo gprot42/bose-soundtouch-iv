@@ -5,7 +5,9 @@
 # Modes (choose one or both):
 #   --flash          Download latest WST4 firmware and write Update.stu  (default)
 #   --ssh            Write empty remote_services file (enables passwordless root SSH via SoundCork)
-#   --both           Both --flash and --ssh on the same stick
+#   --both           Write both files on one stick — still requires TWO separate pedestal procedures
+#                    (see "Flash vs SSH" in README.flash.md). For the SSH-only pass after flashing,
+#                    prefer --ssh so Update.stu is not present and cannot re-trigger a firmware update.
 #
 # Options:
 #   --version VER    Use a specific firmware version (e.g. 27.00.06). Default: latest.
@@ -17,7 +19,8 @@
 #
 # Usage examples:
 #   ./bose-usb-prep.sh                          # interactive, flash mode
-#   ./bose-usb-prep.sh --both                   # flash + SSH mode
+#   ./bose-usb-prep.sh --both                   # both files on stick; flash first, SSH pass later
+#   ./bose-usb-prep.sh --ssh                    # SSH-only stick (use after firmware flash)
 #   ./bose-usb-prep.sh --ssh --dry-run          # preview SSH mode, no changes
 #   ./bose-usb-prep.sh --firmware ./my.zip      # use already-downloaded firmware zip
 #   ./bose-usb-prep.sh --list-versions          # see all known firmware versions
@@ -124,6 +127,13 @@ echo -e "  Mode    : $(
 )"
 echo -e "  OS      : $OS"
 $DRY_RUN && echo -e "  ${YELLOW}DRY-RUN : no changes will be made${RESET}"
+if $MODE_FLASH && $MODE_SSH; then
+    echo ""
+    echo -e "  ${YELLOW}Note:${RESET}  --both puts Update.stu and remote_services on the stick, but the"
+    echo "         pedestal runs firmware flash and SSH enable as separate procedures."
+    echo "         Flashing does not turn on SSH. After WiFi setup, run --ssh and do the"
+    echo "         SSH power-cycle pass (README.flash.md § Flash vs SSH)."
+fi
 echo ""
 hr
 echo -e "${BOLD}  Requirements${RESET}"
@@ -884,8 +894,17 @@ main() {
     hr
     echo ""
 
+    if $MODE_FLASH && $MODE_SSH; then
+        echo -e "${BOLD}Workflow — --both requires two separate pedestal passes:${RESET}"
+        echo "  Pass 1 (firmware):  steps below — remove USB when the pedestal reboots."
+        echo "  Pass 2 (SSH):       after WiFi setup, run ./bose-usb-prep.sh --ssh for an"
+        echo "                      SSH-only stick, then follow the SSH steps below."
+        echo "  Inserting this --both stick for Pass 2 may re-trigger a firmware update."
+        echo ""
+    fi
+
     if $MODE_FLASH; then
-        echo -e "${BOLD}Next steps — firmware flash:${RESET}"
+        echo -e "${BOLD}Next steps — firmware flash (Pass 1 if you used --both):${RESET}"
         echo "  The Wave SoundTouch IV is TWO units: the Wave console (display +"
         echo "  numbered buttons + volume) on top, and the SoundTouch pedestal"
         echo "  (USB port + Control button) underneath. The pedestal is what"
@@ -916,13 +935,25 @@ main() {
     fi
 
     if $MODE_SSH; then
-        echo -e "${BOLD}Next steps — SSH enable (SoundCork):${RESET}"
-        echo "  1. Power the pedestal OFF — pull the AC cord completely."
-        echo "  2. Insert the USB stick into the USB-A port on the back."
-        echo "  3. Plug the AC cord back in and wait ~60 seconds."
-        echo "  4. SSH in (no password):  ssh root@<speaker-ip>"
-        echo "  5. Make SSH persistent:   ssh root@<speaker-ip> 'touch /mnt/nv/remote_services'"
-        echo "  6. Follow README.flash.md §5 for the full SoundCork setup."
+        if $MODE_FLASH; then
+            echo -e "${BOLD}Next steps — SSH enable (Pass 2 — do this AFTER firmware flash and WiFi setup):${RESET}"
+            echo "  Re-prepare an SSH-only stick first:  ./bose-usb-prep.sh --ssh"
+            echo "  (Do not reuse the --both stick — Update.stu may trigger another flash.)"
+            echo ""
+        else
+            echo -e "${BOLD}Next steps — SSH enable (SoundCork):${RESET}"
+        fi
+        echo "  1. Speaker must already be on your home WiFi (port 8090 reachable)."
+        echo "  2. Power the pedestal OFF — pull the AC cord completely."
+        echo "  3. Insert the SSH-only USB into Setup B (USB-A jack on the pedestal back)."
+        echo "     Use Setup B, not Setup A (Micro-USB), unless you have a known-good OTG adapter."
+        echo "  4. Plug the AC cord back in and wait ~60 seconds."
+        echo "  5. SSH in (no password):  ssh root@<speaker-ip>"
+        echo "  6. Make SSH persistent:   ssh root@<speaker-ip> 'touch /mnt/nv/remote_services'"
+        echo "  7. Follow README.flash.md §5 for the full SoundCork setup."
+        echo ""
+        echo "  If port 22 still refuses: try Ethernet for that boot, a different USB 2.0"
+        echo "  stick, and confirm the stick contains only remote_services (no Update.stu)."
         echo ""
     fi
 }
