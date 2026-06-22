@@ -406,3 +406,18 @@ int upnp_rc_set_volume(const char *rc_control, int volume)
     return upnp_soap_call(rc_control, UPNP_RENDERING_CTRL_SVC, "SetVolume",
                           args, NULL, 0);
 }
+
+int upnp_rc_set_mute(const char *rc_control, bool mute)
+{
+    if (rc_control == NULL)
+        return -1;
+
+    char args[256];
+    snprintf(args, sizeof(args),
+        "<InstanceID>0</InstanceID>"
+        "<Channel>Master</Channel>"
+        "<DesiredMute>%d</DesiredMute>",
+        mute ? 1 : 0);
+    return upnp_soap_call(rc_control, UPNP_RENDERING_CTRL_SVC, "SetMute",
+                          args, NULL, 0);
+}

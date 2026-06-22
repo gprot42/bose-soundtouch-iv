@@ -142,3 +142,30 @@ int upnp_cast_stop(upnp_cast_session_t *s)
     s->active_source[0] = '\0';
     return 0;
 }
+
+int upnp_cast_volume_percent(float vlc_volume)
+{
+    if (vlc_volume < 0.f)
+        vlc_volume = 0.f;
+
+    int level = (int)(vlc_volume * 100.f + 0.5f);
+    if (level > 100)
+        level = 100;
+    return level;
+}
+
+int upnp_cast_sync_volume(upnp_cast_session_t *s, float vlc_volume, bool mute,
+                          bool sync_mute, bool sync_volume)
+{
+    if (s == NULL || s->device.rc_control == NULL)
+        return -1;
+
+    if (sync_mute && upnp_rc_set_mute(s->device.rc_control, mute) != 0)
+        return -1;
+
+    if (mute || !sync_volume)
+        return 0;
+
+    return upnp_rc_set_volume(s->device.rc_control,
+                              upnp_cast_volume_percent(vlc_volume));
+}

@@ -11,6 +11,7 @@
 #include <vlc_block.h>
 #include <vlc_demux.h>
 #include <vlc_input.h>
+#include <vlc_playlist.h>
 #include <vlc_variables.h>
 #include <vlc_configuration.h>
 #include <vlc_url.h>
@@ -184,6 +185,7 @@ typedef struct upnp_demux_sys
     demux_t *demux;
     upnp_cast_session_t *session;
     input_thread_t *input;
+    playlist_t *playlist;
     bool enabled;
     bool folder_mode;
     bool directory_expanded;
@@ -194,11 +196,16 @@ typedef struct upnp_demux_sys
     bool renderer_paused;
     bool stop_sent;
     bool ui_length_set;
+    bool volume_sync;
+    int last_volume;
+    bool last_mute;
     vlc_tick_t cast_start;
     vlc_tick_t play_confirmed_at;
     vlc_tick_t length;
     vlc_tick_t time;
 } upnp_demux_sys_t;
+
+#define UPNP_VOLUME_UNSET (-1)
 
 #define CAST_PLAY_TIMEOUT (120 * CLOCK_FREQ)
 #define CAST_EOF_MARGIN   (3 * CLOCK_FREQ)
@@ -422,6 +429,130 @@ static void bind_cast_var_to_input(demux_t *demux, upnp_cast_session_t *session)
     var_SetAddress(input, UPNP_CAST_VAR, session);
 }
 
+static playlist_t *get_input_playlist(input_thread_t *input)
+{
+    if (input == NULL || input->obj.parent == NULL)
+        return NULL;
+
+    return (playlist_t *)input->obj.parent;
+}
+
+static void read_playlist_volume(playlist_t *playlist, float *vol, bool *mute)
+{
+    float level = playlist_VolumeGet(playlist);
+
+    if (level < 0.f)
+        level = var_GetFloat(playlist, "volume");
+    if (level < 0.f)
+        level = 1.f;
+
+    *vol = level;
+    *mute = var_GetBool(playlist, "mute");
+}
+
+static void push_renderer_volume(upnp_demux_sys_t *sys, float vol, bool mute)
+{
+    if (sys == NULL || !sys->enabled || !sys->track_active)
+        return;
+    if (sys->session == NULL || sys->session->device.rc_control == NULL)
+        return;
+
+    int level = upnp_cast_volume_percent(vol);
+    bool mute_changed = sys->last_mute != mute;
+    bool volume_changed = sys->last_volume != level;
+
+    if (!mute_changed && !volume_changed)
+        return;
+
+    if (upnp_cast_sync_volume(sys->session, vol, mute, mute_changed,
+                              !mute && (volume_changed || mute_changed)) != 0)
+    {
+        msg_Warn(sys->demux, "UPnP volume sync failed (level=%d, mute=%d)",
+                 level, mute ? 1 : 0);
+        return;
+    }
+
+    sys->last_mute = mute;
+    sys->last_volume = mute ? 0 : level;
+    msg_Dbg(sys->demux, "UPnP volume synced to %d%%%s",
+            level, mute ? " (muted)" : "");
+}
+
+static int VolumeCallback(vlc_object_t *obj, const char *name,
+                          vlc_value_t oldval, vlc_value_t newval, void *data)
+{
+    upnp_demux_sys_t *sys = data;
+
+    (void)obj;
+    (void)name;
+    (void)oldval;
+
+    if (newval.f_float < 0.f)
+        return VLC_SUCCESS;
+
+    bool mute = sys->playlist != NULL && var_GetBool(sys->playlist, "mute");
+    push_renderer_volume(sys, newval.f_float, mute);
+    return VLC_SUCCESS;
+}
+
+static int MuteCallback(vlc_object_t *obj, const char *name,
+                        vlc_value_t oldval, vlc_value_t newval, void *data)
+{
+    upnp_demux_sys_t *sys = data;
+    float vol = 1.f;
+    bool ignored_mute = false;
+
+    (void)obj;
+    (void)name;
+    (void)oldval;
+
+    if (sys->playlist != NULL)
+        read_playlist_volume(sys->playlist, &vol, &ignored_mute);
+    push_renderer_volume(sys, vol, newval.b_bool);
+    return VLC_SUCCESS;
+}
+
+static void detach_volume_sync(upnp_demux_sys_t *sys)
+{
+    if (sys == NULL || !sys->volume_sync || sys->playlist == NULL)
+        return;
+
+    var_DelCallback(sys->playlist, "volume", VolumeCallback, sys);
+    var_DelCallback(sys->playlist, "mute", MuteCallback, sys);
+    sys->volume_sync = false;
+    sys->playlist = NULL;
+    sys->last_volume = UPNP_VOLUME_UNSET;
+}
+
+static void attach_volume_sync(demux_t *demux, upnp_demux_sys_t *sys)
+{
+    float vol;
+    bool mute;
+
+    cache_filter_input(demux, sys);
+    if (sys->input == NULL || sys->volume_sync)
+        return;
+
+    sys->playlist = get_input_playlist(sys->input);
+    if (sys->playlist == NULL)
+        return;
+
+    if (sys->session->device.rc_control == NULL)
+    {
+        msg_Dbg(demux, "UPnP renderer has no RenderingControl endpoint");
+        return;
+    }
+
+    var_AddCallback(sys->playlist, "volume", VolumeCallback, sys);
+    var_AddCallback(sys->playlist, "mute", MuteCallback, sys);
+    sys->volume_sync = true;
+
+    read_playlist_volume(sys->playlist, &vol, &mute);
+    sys->last_volume = UPNP_VOLUME_UNSET;
+    sys->last_mute = !mute;
+    push_renderer_volume(sys, vol, mute);
+}
+
 static bool input_has_ended(input_thread_t *input)
 {
     if (input == NULL)
@@ -548,6 +679,8 @@ static int start_cast_uri(demux_t *demux, upnp_demux_sys_t *sys,
     sys->ui_length_set = false;
     probe_length_from_next(demux, sys);
     probe_length_from_uri(source, sys);
+
+    attach_volume_sync(demux, sys);
 
     msg_Info(demux, "Casting '%s' to %s via %s", source,
              sys->session->device.friendly_name, sys->session->media_url);
@@ -676,6 +809,7 @@ static int DemuxOpen(vlc_object_t *obj)
     demux->pf_demux = DemuxDemux;
     demux->pf_control = DemuxControl;
 
+    sys->last_volume = UPNP_VOLUME_UNSET;
     sys->folder_mode = is_playlist_demux(demux);
     bind_cast_var_to_input(demux, sys->session);
     probe_length_from_next(demux, sys);
@@ -696,6 +830,7 @@ static void DemuxClose(vlc_object_t *obj)
 
     /* Renderer casts set sout-keep; this is the main stop path for the Bose. */
     stop_remote_playback(sys);
+    detach_volume_sync(sys);
 
     cache_filter_input(demux, sys);
     if (sys->session->owner_input == sys->input)
@@ -815,6 +950,7 @@ static int DemuxControl(demux_t *demux, int query, va_list args)
 
         case DEMUX_FILTER_DISABLE:
             stop_remote_playback(sys);
+            detach_volume_sync(sys);
             sys->enabled = false;
             cache_filter_input(demux, sys);
             if (sys->session->owner_input == sys->input)

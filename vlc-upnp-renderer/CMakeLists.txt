@@ -105,6 +105,10 @@ if(BUILD_TESTS)
     add_executable(test_soap tests/test_soap.c src/upnp_soap.c src/upnp_common.c)
     target_include_directories(test_soap PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME soap_build COMMAND test_soap)
+
+    add_executable(test_volume tests/test_volume.c src/upnp_cast.c ${UPNP_COMMON_SOURCES})
+    target_include_directories(test_volume PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME volume_map COMMAND test_volume)
 endif()
 
 message(STATUS "VLC_DIR:         ${VLC_DIR}")

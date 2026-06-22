@@ -4,6 +4,7 @@
 #ifndef UPNP_SOAP_H
 #define UPNP_SOAP_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 int upnp_soap_call(const char *control_url, const char *service_type,
@@ -20,6 +21,7 @@ int upnp_av_get_position_info(const char *av_control, char *rel_time, size_t rel
                               char *track_dur, size_t dur_len);
 
 int upnp_rc_set_volume(const char *rc_control, int volume);
+int upnp_rc_set_mute(const char *rc_control, bool mute);
 
 /* Parse a simple <tag>value</tag> element from a SOAP response body. */
 int upnp_soap_parse_tag(const char *xml, const char *tag, char *out, size_t outlen);
