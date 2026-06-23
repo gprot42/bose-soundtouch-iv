@@ -1,5 +1,14 @@
 # Bose Firmware SSH Research (Wave SoundTouch IV)
 
+> **DISCLAIMER — USE AT YOUR OWN RISK**
+> Modifying, patching, or reflashing your device's firmware may permanently
+> damage it, void your warranty, or leave it in an unrecoverable state.
+> The tools and instructions in this repository are provided **as-is, with no
+> warranty of any kind**. The authors accept no responsibility for bricked
+> hardware, data loss, or any other damage resulting from following these
+> instructions. You are solely responsible for any actions you take on your
+> own equipment.
+
 Fork of [`bose-usb-flash/`](../bose-usb-flash/) for **analyzing `Update.stu`** and building a firmware image with **persistent SSH**.
 
 The parent folder handles proven USB recovery (`Update.stu` flash + `remote_services` stick). This folder is the **research track**: analyze, patch, repack, and eventually deliver custom firmware via USB or redirected `swUpdateUrl`.
