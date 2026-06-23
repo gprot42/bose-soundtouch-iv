@@ -1,0 +1,67 @@
+# -----------------------------------------------------------------------
+# DO NOT PUBLISH -- Bose proprietary firmware and extracted content
+# (copyright Bose Corporation; publishing may violate DMCA § 1201 and
+# Bose's copyright. See RESEARCH.md for legal notes.)
+# -----------------------------------------------------------------------
+
+# Firmware container files (stock or patched)
+*.stu
+
+# UBI / UBIFS / squashfs / raw images
+*.img
+*.ubifs
+*.sqsh
+*.sqfs
+*.ubi
+
+# Compressed archives that may contain firmware
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+
+# -----------------------------------------------------------------------
+# Extracted rootfs and build artefacts
+# (any directory containing Bose binaries unpacked from the firmware)
+# -----------------------------------------------------------------------
+
+# The whole work/ tree (downloaded firmware, extracted trees, build dirs)
+work/*
+!work/.gitkeep
+
+# Explicit extracted / intermediate paths (belt-and-suspenders)
+work/extract/
+work/extract_patched/
+work/rootfs*/
+work/ubifs-root/
+work/.build-ssh-rootfs/
+work/.new_ubi.img
+work/.sections/
+
+# SSH host keys extracted from the device (security risk + copyright)
+work/**/*ssh_host_*
+
+# -----------------------------------------------------------------------
+# macOS and editor noise
+# -----------------------------------------------------------------------
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+
+# -----------------------------------------------------------------------
+# Misc artefacts
+# -----------------------------------------------------------------------
+artifacts/
+rootfs_sqfs/
