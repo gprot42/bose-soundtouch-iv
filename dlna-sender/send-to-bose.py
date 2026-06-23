@@ -997,6 +997,18 @@ def now_playing_track_title(info: dict[str, str]) -> str:
     return info.get("track") or info.get("itemName") or ""
 
 
+def clear_display(ip: str) -> bool:
+    """Blank all remote-display fields and push to the VFD."""
+    try:
+        mod = _display_helpers()
+        last = mod.push_fields(ip, {}, clear=True)
+        debug_log("display cleared")
+        return "OK" in last
+    except OSError as exc:
+        debug_log(f"display clear skipped: {exc}")
+        return False
+
+
 def push_display_title(
     ip: str,
     title: str,
@@ -1194,9 +1206,13 @@ def _play_tracks(
 
         if len(tracks) > 1:
             print("\nFolder finished.")
+            if bose_ip:
+                clear_display(bose_ip)
     except KeyboardInterrupt:
         print("\nStopping ...")
         stop_renderer(device)
+        if bose_ip:
+            clear_display(bose_ip)
         raise
 
 
@@ -1249,44 +1265,52 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                 httpd.shutdown()
             return
 
-        for track_idx, path in enumerate(files):
-            if track_idx > 0:
-                debug_log("album: stop before next track (clear stale now-playing)")
-                stop_renderer(device)
-                _sleep_interruptible(0.5)
-            label = os.path.basename(path)
-            shown = display_title(label)
-            if not no_transcode and needs_transcode(path):
-                print(f"\nTranscoding: {label}")
-                temp_path, cleanup = transcode_to_mp3(
-                    path, title=shown, artist=artist, album=album,
-                )
-                duration = probe_duration(temp_path)
-                httpd, _, url_for = start_media_server(
-                    bose_host, file_path=temp_path,
-                )
-                try:
-                    _play_tracks(
-                        device, [(label, url_for(temp_path), duration)],
-                        block=False,
-                        album_mode=True,
-                        artist=artist, album=album,
+        try:
+            for track_idx, path in enumerate(files):
+                if track_idx > 0:
+                    debug_log("album: stop before next track (clear stale now-playing)")
+                    stop_renderer(device)
+                    _sleep_interruptible(0.5)
+                label = os.path.basename(path)
+                shown = display_title(label)
+                if not no_transcode and needs_transcode(path):
+                    print(f"\nTranscoding: {label}")
+                    temp_path, cleanup = transcode_to_mp3(
+                        path, title=shown, artist=artist, album=album,
                     )
-                finally:
-                    httpd.shutdown()
-                    cleanup()
-            else:
-                duration = probe_duration(path)
-                httpd, _, url_for = start_media_server(bose_host, file_path=path)
-                try:
-                    _play_tracks(
-                        device, [(label, url_for(path), duration)],
-                        block=False,
-                        album_mode=True,
-                        artist=artist, album=album,
+                    duration = probe_duration(temp_path)
+                    httpd, _, url_for = start_media_server(
+                        bose_host, file_path=temp_path,
                     )
-                finally:
-                    httpd.shutdown()
+                    try:
+                        _play_tracks(
+                            device, [(label, url_for(temp_path), duration)],
+                            block=False,
+                            album_mode=True,
+                            artist=artist, album=album,
+                        )
+                    finally:
+                        httpd.shutdown()
+                        cleanup()
+                else:
+                    duration = probe_duration(path)
+                    httpd, _, url_for = start_media_server(bose_host, file_path=path)
+                    try:
+                        _play_tracks(
+                            device, [(label, url_for(path), duration)],
+                            block=False,
+                            album_mode=True,
+                            artist=artist, album=album,
+                        )
+                    finally:
+                        httpd.shutdown()
+        except KeyboardInterrupt:
+            if bose_host:
+                clear_display(bose_host)
+            raise
+        print("\nFolder finished.")
+        if bose_host:
+            clear_display(bose_host)
         return
 
     if not os.path.isfile(source):
