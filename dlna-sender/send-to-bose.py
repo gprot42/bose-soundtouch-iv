@@ -63,7 +63,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from typing import BinaryIO, Callable
 
-DISPLAY_INTERVAL = 3.0   # re-push title; firmware overwrites on now-playing refresh
+DISPLAY_INTERVAL = 1.0   # re-push title; firmware overwrites on now-playing refresh
+DISPLAY_BURST_DELAYS = (0.5, 1.0, 2.0)  # extra pushes after each track change
 
 DEBUG = False
 
@@ -971,6 +972,31 @@ def _bose_volume_level(ip: str) -> int:
     return 30
 
 
+def get_now_playing(ip: str) -> dict[str, str]:
+    """Read :8090/nowPlaying title lines (empty dict on failure)."""
+    try:
+        with urllib.request.urlopen(f"http://{ip}:8090/nowPlaying", timeout=3) as resp:
+            root = ET.fromstring(resp.read())
+    except Exception as exc:
+        debug_log(f"nowPlaying fetch failed: {exc}")
+        return {}
+    for el in root.iter():
+        el.tag = el.tag.split("}")[-1]
+    out: dict[str, str] = {}
+    for tag in ("track", "artist", "album", "stationName"):
+        el = root.find(tag)
+        if el is not None and el.text:
+            out[tag] = el.text.strip()
+    item = root.find(".//itemName")
+    if item is not None and item.text:
+        out["itemName"] = item.text.strip()
+    return out
+
+
+def now_playing_track_title(info: dict[str, str]) -> str:
+    return info.get("track") or info.get("itemName") or ""
+
+
 def push_display_title(
     ip: str,
     title: str,
@@ -978,6 +1004,7 @@ def push_display_title(
     artist: str = "",
     album: str = "",
     source: str = "DLNA",
+    clear: bool = False,
 ) -> bool:
     """
     Push now-playing text to the Wave IV VFD via :17000 abl rdset/rdsend.
@@ -992,14 +1019,51 @@ def push_display_title(
             fields["album"] = album
         if source:
             fields["source"] = source
-        last = mod.push_fields(ip, fields)
+        last = mod.push_fields(ip, fields, clear=clear)
         if "OK" not in last:
             print(f"  Display warning: rdsend unclear: {last!r}", file=sys.stderr)
             return False
+        debug_log(
+            f"display push: title={fields['title']!r} clear={clear} "
+            f"nowPlaying={now_playing_track_title(get_now_playing(ip))!r}"
+        )
         return True
     except OSError as exc:
         print(f"  Display update skipped: {exc}", file=sys.stderr)
         return False
+
+
+def establish_track_display(
+    ip: str,
+    label: str,
+    *,
+    artist: str = "",
+    album: str = "",
+    burst: bool = False,
+    sync_now_playing: bool = False,
+) -> bool:
+    """
+    Clear stale remote-display fields, push the new track, and (for albums)
+    burst re-push so firmware now-playing refreshes do not leave the previous
+    track on the VFD.
+    """
+    shown = display_title(label)
+    ok = push_display_title(ip, label, artist=artist, album=album, clear=True)
+    if burst:
+        for delay in DISPLAY_BURST_DELAYS:
+            _sleep_interruptible(delay)
+            ok = push_display_title(ip, label, artist=artist, album=album) or ok
+    if sync_now_playing:
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            np_title = now_playing_track_title(get_now_playing(ip))
+            if np_title and (np_title == shown or shown in np_title or np_title in shown):
+                debug_log(f"nowPlaying synced: {np_title!r}")
+                break
+            debug_log(f"nowPlaying still {np_title!r}; re-pushing {shown!r}")
+            ok = push_display_title(ip, label, artist=artist, album=album) or ok
+            _sleep_interruptible(0.5)
+    return ok
 
 
 def display_refresher(
@@ -1008,16 +1072,25 @@ def display_refresher(
     *,
     artist: str = "",
     album: str = "",
+    interval: float = DISPLAY_INTERVAL,
 ) -> Callable[[], None]:
-    """Return a callback that re-pushes the title at DISPLAY_INTERVAL."""
+    """Return a callback that re-pushes the title on each poll (throttled)."""
     last = 0.0
+    expected = display_title(title)
 
     def refresh() -> None:
         nonlocal last
         now = time.monotonic()
-        if now - last >= DISPLAY_INTERVAL:
-            push_display_title(ip, title, artist=artist, album=album)
-            last = now
+        if now - last < interval:
+            return
+        np_title = now_playing_track_title(get_now_playing(ip))
+        if np_title and np_title != expected:
+            debug_log(
+                f"display drift: VFD buffer expected {expected!r}, "
+                f"nowPlaying has {np_title!r}; re-pushing"
+            )
+        push_display_title(ip, title, artist=artist, album=album)
+        last = now
 
     return refresh
 
@@ -1047,11 +1120,13 @@ def _play_tracks(
     tracks: list[TrackSpec],
     *,
     block: bool | None = None,
+    album_mode: bool = False,
     artist: str = "",
     album: str = "",
 ) -> None:
     if block is None:
-        block = len(tracks) == 1
+        block = not album_mode and len(tracks) == 1
+    album_mode = album_mode or len(tracks) > 1
 
     bose_ip = urllib.parse.urlparse(device["location"]).hostname or ""
     debug_print_device(device, bose_ip or None)
@@ -1059,16 +1134,18 @@ def _play_tracks(
     print(f"Renderer: {device['friendly_name']}  ({device['av_ctrl']})")
     try:
         for i, track in enumerate(tracks, 1):
+            if album_mode and i > 1:
+                debug_log("album: stop before next track (clear stale now-playing)")
+                stop_renderer(device)
+                _sleep_interruptible(0.5)
             label, media_url, expected_duration = _track_parts(track)
-            if len(tracks) > 1:
+            if album_mode or len(tracks) > 1:
                 print(f"\n[{i}/{len(tracks)}] {label}")
                 print(f"URL: {media_url}")
             else:
                 print("Setting URI ...")
 
             shown = display_title(label)
-            if bose_ip:
-                push_display_title(bose_ip, label, artist=artist, album=album)
 
             debug_log(
                 f"play track {i}/{len(tracks)}: {label} "
@@ -1078,8 +1155,13 @@ def _play_tracks(
                 sys.exit("Play command failed — check device IP and port.")
 
             if bose_ip:
-                # DIDL populates :8090/nowPlaying but the VFD is driven via :17000.
-                pushed = push_display_title(bose_ip, label, artist=artist, album=album)
+                # DIDL populates :8090/nowPlaying; the VFD is driven via :17000 and
+                # firmware refresh can repaint stale lines unless we clear + burst.
+                pushed = establish_track_display(
+                    bose_ip, label, artist=artist, album=album,
+                    burst=album_mode,
+                    sync_now_playing=album_mode,
+                )
                 if wait_for_playback_start(device, timeout=10):
                     pushed = (
                         push_display_title(bose_ip, label, artist=artist, album=album)
@@ -1160,12 +1242,18 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                 for f in files
             ]
             try:
-                _play_tracks(device, tracks, artist=artist, album=album)
+                _play_tracks(
+                    device, tracks, artist=artist, album=album, album_mode=True,
+                )
             finally:
                 httpd.shutdown()
             return
 
-        for path in files:
+        for track_idx, path in enumerate(files):
+            if track_idx > 0:
+                debug_log("album: stop before next track (clear stale now-playing)")
+                stop_renderer(device)
+                _sleep_interruptible(0.5)
             label = os.path.basename(path)
             shown = display_title(label)
             if not no_transcode and needs_transcode(path):
@@ -1181,6 +1269,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                     _play_tracks(
                         device, [(label, url_for(temp_path), duration)],
                         block=False,
+                        album_mode=True,
                         artist=artist, album=album,
                     )
                 finally:
@@ -1193,6 +1282,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                     _play_tracks(
                         device, [(label, url_for(path), duration)],
                         block=False,
+                        album_mode=True,
                         artist=artist, album=album,
                     )
                 finally:
