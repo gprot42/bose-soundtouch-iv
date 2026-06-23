@@ -12,7 +12,7 @@ and streaming music over DLNA/UPnP without Bose's apps or servers.
 | Path | What it is |
 |------|------------|
 | [`bosman-soundtouch-iv-controller/`](bosman-soundtouch-iv-controller/) | BosMan — web/Android app for volume, presets, zones, and DLNA browsing |
-| [`dlna-sender/`](dlna-sender/) | `send-to-bose.py` — zero-install macOS script to push files, folders, and streams to the Bose |
+| [`dlna-sender/`](dlna-sender/) | `send-to-bose.py` — zero-install macOS script to push files, folders, and streams to the Bose; `send-display-text.py` — show custom text on the front display |
 | [`bose-usb-flash/`](bose-usb-flash/) | Offline USB firmware reflash when the pedestal is stuck |
 | [`bluetooth-setup/`](bluetooth-setup/) | macOS helpers for pairing the Bose over Bluetooth |
 | [`vlc-upnp-renderer/`](vlc-upnp-renderer/) | VLC plugin to cast to UPnP/DLNA renderers — Bose appears in **Playback → Renderer** (see [README](vlc-upnp-renderer/README.md)) |
@@ -27,6 +27,7 @@ and streaming music over DLNA/UPnP without Bose's apps or servers.
 | [`bose-usb-flash/README.flash.md`](bose-usb-flash/README.flash.md) | Pedestal stuck — Wi-Fi AP up but no TCP ports respond |
 | [`bosman-soundtouch-iv-controller/README.md`](bosman-soundtouch-iv-controller/README.md) | Running and developing the BosMan app |
 | [`README.SoundTouchIV-wifi.md`](README.SoundTouchIV-wifi.md) | Wi-Fi setup protocol, field diagnostics, root-cause analysis |
+| [`README.display-text.md`](README.display-text.md) | Showing custom text on the Wave SoundTouch IV front display |
 
 ---
 
