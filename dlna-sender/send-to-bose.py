@@ -67,6 +67,7 @@ DISPLAY_INTERVAL = 1.0   # re-push title; firmware overwrites on now-playing ref
 DISPLAY_BURST_DELAYS = (0.5, 1.0, 2.0)  # extra pushes after each track change
 
 DEBUG = False
+_stop_requested = False
 
 
 def debug_log(msg: str) -> None:
@@ -287,6 +288,46 @@ def local_ip_toward(dest_ip: str) -> str:
         s.close()
 
 
+class _ServingAbort:
+    """Track in-flight HTTP transfers so Ctrl+C can drop the Bose connection."""
+
+    abort: bool = False
+    _lock = threading.Lock()
+    _active: list[http.server.BaseHTTPRequestHandler] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.abort = False
+        with cls._lock:
+            cls._active.clear()
+
+    @classmethod
+    def register(cls, handler: http.server.BaseHTTPRequestHandler) -> None:
+        with cls._lock:
+            cls._active.append(handler)
+
+    @classmethod
+    def unregister(cls, handler: http.server.BaseHTTPRequestHandler) -> None:
+        with cls._lock:
+            try:
+                cls._active.remove(handler)
+            except ValueError:
+                pass
+
+    @classmethod
+    def request_abort(cls) -> None:
+        cls.abort = True
+        with cls._lock:
+            handlers = list(cls._active)
+        for handler in handlers:
+            conn = getattr(handler, "connection", None)
+            if conn is not None:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
 class _MediaHandler(http.server.BaseHTTPRequestHandler):
     """Serve files from serve_dir; single-file mode also accepts any URL path."""
 
@@ -379,11 +420,12 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if not send_body:
             return
+        _ServingAbort.register(self)
         try:
             with open(file_path, "rb") as fh:
                 fh.seek(start)
                 remaining = length
-                while remaining > 0:
+                while remaining > 0 and not _ServingAbort.abort:
                     chunk = fh.read(min(self._CHUNK, remaining))
                     if not chunk:
                         break
@@ -391,6 +433,8 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
                     remaining -= len(chunk)
         except (OSError, BrokenPipeError, ConnectionResetError):
             pass
+        finally:
+            _ServingAbort.unregister(self)
 
     def do_HEAD(self):
         file_path = self._resolve_path()
@@ -431,8 +475,9 @@ class _StreamHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "none")
         self.send_header("Connection", "close")
         self.end_headers()
+        _ServingAbort.register(self)
         try:
-            while True:
+            while not _ServingAbort.abort:
                 chunk = src.read(65536)
                 if not chunk:
                     break
@@ -440,10 +485,12 @@ class _StreamHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
+            if not _ServingAbort.abort:
+                self.wfile.write(b"0\r\n\r\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
+            _ServingAbort.unregister(self)
             cb = type(self).on_close
             if cb:
                 cb()
@@ -616,6 +663,14 @@ def ffmpeg_mp3_pipe(input_path: str) -> subprocess.Popen:
     )
 
 
+def shutdown_server(httpd: http.server.HTTPServer, timeout: float = 2.0) -> None:
+    """Stop the local HTTP server without waiting for the Bose to finish downloading."""
+    _ServingAbort.request_abort()
+    thread = threading.Thread(target=httpd.shutdown, daemon=True)
+    thread.start()
+    thread.join(timeout)
+
+
 def start_stream_server(
     bose_ip: str,
     byte_source: BinaryIO,
@@ -624,6 +679,7 @@ def start_stream_server(
     path: str = "/stream.mp3",
 ) -> tuple[http.server.HTTPServer, str]:
     """Serve a byte stream over HTTP; return (httpd, media_url)."""
+    _ServingAbort.reset()
     _StreamHandler.byte_source = byte_source
     _StreamHandler.on_close = on_close
     _StreamHandler.debug = DEBUG
@@ -645,6 +701,7 @@ def start_media_server(
     if bool(file_path) == bool(dir_path):
         raise ValueError("Provide exactly one of file_path or dir_path")
 
+    _ServingAbort.reset()
     _MediaHandler.single_file = os.path.abspath(file_path) if file_path else None
     _MediaHandler.serve_dir = os.path.abspath(dir_path or os.path.dirname(file_path))
     _MediaHandler.debug = DEBUG
@@ -870,7 +927,7 @@ def wait_for_track_end(
     error_streak = 0
     last_rel = 0.0
     end_margin = 2.0
-    while True:
+    while not _stop_requested:
         if on_poll:
             on_poll()
         state = get_transport_state(device)
@@ -997,11 +1054,12 @@ def now_playing_track_title(info: dict[str, str]) -> str:
     return info.get("track") or info.get("itemName") or ""
 
 
-def clear_display(ip: str) -> bool:
+def clear_display(ip: str, *, fast: bool = False) -> bool:
     """Blank all remote-display fields and push to the VFD."""
     try:
         mod = _display_helpers()
-        last = mod.push_fields(ip, {}, clear=True)
+        wait = 0.15 if fast else 0.8
+        last = mod.push_fields(ip, {}, clear=True, wait=wait)
         debug_log("display cleared")
         return "OK" in last
     except OSError as exc:
@@ -1022,6 +1080,8 @@ def push_display_title(
     Push now-playing text to the Wave IV VFD via :17000 abl rdset/rdsend.
     Also nudges the console to redraw (sys volume N updateDisplay).
     """
+    if _stop_requested:
+        return False
     try:
         mod = _display_helpers()
         fields: dict[str, str] = {"title": display_title(title)}
@@ -1051,30 +1111,20 @@ def establish_track_display(
     *,
     artist: str = "",
     album: str = "",
+    clear: bool = False,
     burst: bool = False,
-    sync_now_playing: bool = False,
 ) -> bool:
     """
-    Clear stale remote-display fields, push the new track, and (for albums)
-    burst re-push so firmware now-playing refreshes do not leave the previous
-    track on the VFD.
+    Push the current track to the VFD. Optionally clear stale fields first
+    (album track changes) and burst re-push after firmware refresh windows.
     """
-    shown = display_title(label)
-    ok = push_display_title(ip, label, artist=artist, album=album, clear=True)
+    ok = push_display_title(
+        ip, label, artist=artist, album=album, clear=clear,
+    )
     if burst:
         for delay in DISPLAY_BURST_DELAYS:
             _sleep_interruptible(delay)
             ok = push_display_title(ip, label, artist=artist, album=album) or ok
-    if sync_now_playing:
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            np_title = now_playing_track_title(get_now_playing(ip))
-            if np_title and (np_title == shown or shown in np_title or np_title in shown):
-                debug_log(f"nowPlaying synced: {np_title!r}")
-                break
-            debug_log(f"nowPlaying still {np_title!r}; re-pushing {shown!r}")
-            ok = push_display_title(ip, label, artist=artist, album=album) or ok
-            _sleep_interruptible(0.5)
     return ok
 
 
@@ -1092,6 +1142,8 @@ def display_refresher(
 
     def refresh() -> None:
         nonlocal last
+        if _stop_requested:
+            return
         now = time.monotonic()
         if now - last < interval:
             return
@@ -1127,6 +1179,16 @@ def _track_parts(track: TrackSpec) -> tuple[str, str, float | None]:
     return track[0], track[1], None
 
 
+def _interrupt_playback(device: dict, bose_ip: str) -> None:
+    """Stop the renderer, drop any in-flight HTTP stream, and blank the VFD."""
+    global _stop_requested
+    _stop_requested = True
+    _ServingAbort.request_abort()
+    stop_renderer(device)
+    if bose_ip:
+        clear_display(bose_ip, fast=True)
+
+
 def _play_tracks(
     device: dict,
     tracks: list[TrackSpec],
@@ -1136,9 +1198,13 @@ def _play_tracks(
     artist: str = "",
     album: str = "",
 ) -> None:
+    global _stop_requested
+    _stop_requested = False
+
     if block is None:
         block = not album_mode and len(tracks) == 1
     album_mode = album_mode or len(tracks) > 1
+    multi_track = len(tracks) > 1
 
     bose_ip = urllib.parse.urlparse(device["location"]).hostname or ""
     debug_print_device(device, bose_ip or None)
@@ -1166,19 +1232,23 @@ def _play_tracks(
             if not play_uri(device, media_url, title=shown, artist=artist, album=album):
                 sys.exit("Play command failed — check device IP and port.")
 
+            started = wait_for_playback_start(device, timeout=15)
+            if not started:
+                print("  Warning: playback did not start within 15s.", file=sys.stderr)
+
+            pushed = False
             if bose_ip:
-                # DIDL populates :8090/nowPlaying; the VFD is driven via :17000 and
-                # firmware refresh can repaint stale lines unless we clear + burst.
+                # VFD text sticks best once audio is playing; firmware overwrites
+                # idle pushes on the next now-playing refresh.
                 pushed = establish_track_display(
                     bose_ip, label, artist=artist, album=album,
-                    burst=album_mode,
-                    sync_now_playing=album_mode,
+                    clear=multi_track and i > 1,
+                    burst=multi_track,
                 )
-                if wait_for_playback_start(device, timeout=10):
-                    pushed = (
-                        push_display_title(bose_ip, label, artist=artist, album=album)
-                        or pushed
-                    )
+                pushed = (
+                    push_display_title(bose_ip, label, artist=artist, album=album)
+                    or pushed
+                )
                 if pushed:
                     detail = f"{shown}" + (f" — {artist}" if artist else "")
                     print(f"Display : {detail}")
@@ -1192,7 +1262,7 @@ def _play_tracks(
 
             print("Playing. Press Ctrl+C to stop.")
             if block:
-                while True:
+                while not _stop_requested:
                     if refresh_display:
                         refresh_display()
                     _sleep_interruptible(2)
@@ -1210,9 +1280,7 @@ def _play_tracks(
                 clear_display(bose_ip)
     except KeyboardInterrupt:
         print("\nStopping ...")
-        stop_renderer(device)
-        if bose_ip:
-            clear_display(bose_ip)
+        _interrupt_playback(device, bose_ip)
         raise
 
 
@@ -1233,7 +1301,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
         try:
             _play_tracks(device, [("stdin", media_url)])
         finally:
-            httpd.shutdown()
+            shutdown_server(httpd)
         return
 
     if source.startswith("http://") or source.startswith("https://"):
@@ -1262,7 +1330,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                     device, tracks, artist=artist, album=album, album_mode=True,
                 )
             finally:
-                httpd.shutdown()
+                shutdown_server(httpd)
             return
 
         try:
@@ -1290,7 +1358,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                             artist=artist, album=album,
                         )
                     finally:
-                        httpd.shutdown()
+                        shutdown_server(httpd)
                         cleanup()
                 else:
                     duration = probe_duration(path)
@@ -1303,10 +1371,8 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                             artist=artist, album=album,
                         )
                     finally:
-                        httpd.shutdown()
+                        shutdown_server(httpd)
         except KeyboardInterrupt:
-            if bose_host:
-                clear_display(bose_host)
             raise
         print("\nFolder finished.")
         if bose_host:
@@ -1334,7 +1400,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
                 artist=artist, album=album,
             )
         finally:
-            httpd.shutdown()
+            shutdown_server(httpd)
             cleanup()
         return
 
@@ -1346,7 +1412,7 @@ def cmd_play(device: dict, source: str, *, no_transcode: bool = False):
     try:
         _play_tracks(device, [(os.path.basename(source), media_url, duration)])
     finally:
-        httpd.shutdown()
+        shutdown_server(httpd)
 
 
 # ── Discovery helper ──────────────────────────────────────────────────────────

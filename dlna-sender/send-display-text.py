@@ -139,12 +139,18 @@ def refresh_display(ip: str) -> str:
     return responses[-1] if responses else ""
 
 
-def push(ip: str, commands: list[str], *, refresh: bool = True) -> str:
+def push(
+    ip: str,
+    commands: list[str],
+    *,
+    refresh: bool = True,
+    wait: float = 0.8,
+) -> str:
     all_cmds = list(commands)
     if refresh:
         vol = current_volume(ip)
         all_cmds.append(f"sys volume {vol} updateDisplay")
-    responses = cli_session(ip, all_cmds)
+    responses = cli_session(ip, all_cmds, wait=wait)
     last = responses[-1] if responses else ""
     if refresh and "OK" not in last:
         print(f"Warning: updateDisplay response unclear: {last!r}", file=sys.stderr)
@@ -162,10 +168,17 @@ def prepare_display_fields(fields: dict[str, str], *, clear: bool = False) -> di
     return display_fields
 
 
-def push_fields(ip: str, fields: dict[str, str], *, clear: bool = False, refresh: bool = True) -> str:
+def push_fields(
+    ip: str,
+    fields: dict[str, str],
+    *,
+    clear: bool = False,
+    refresh: bool = True,
+    wait: float = 0.8,
+) -> str:
     """Set remote-display fields and push them to the VFD."""
     commands = build_commands(prepare_display_fields(fields, clear=clear), clear)
-    return push(ip, commands, refresh=refresh)
+    return push(ip, commands, refresh=refresh, wait=wait)
 
 
 def main() -> None:
