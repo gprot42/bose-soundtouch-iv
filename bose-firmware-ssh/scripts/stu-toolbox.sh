@@ -136,10 +136,30 @@ cmd_down() {
     colima stop --profile "$COLIMA_PROFILE" || true
 }
 
+case_insensitive_mount() {
+    # APFS/HFS+ default is case-insensitive; the Bose rootfs has colliding
+    # paths (e.g. libxt_MARK.so vs libxt_mark.so) that cannot coexist there.
+    local mp
+    mp="$(df "$REPO" 2>/dev/null | awk 'NR==2{print $NF}')"
+    case "$mp" in
+        "") return 1 ;;
+        /System/Volumes/*|/Volumes/*)
+            # Heuristic only — still warn on typical macOS workspace mounts.
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_unpack() {
     [ $# -eq 2 ] || die "usage: $0 unpack <stu> <rootfs_dir>"
     local stu_host="$1" dest_host="$2"
     [ -f "$stu_host" ] || die "no such file: $stu_host"
+    if case_insensitive_mount; then
+        warn "unpack copies the rootfs onto the macOS repo mount."
+        warn "Case-colliding files (usr/lib/xtables/libxt_MARK.so vs libxt_mark.so, etc.)"
+        warn "will be merged — a later 'rebuild' from that tree can break WiFi/setup."
+        warn "Use 'build-ssh' (keeps extract in-container) or edit only inside 'shell'."
+    fi
     mkdir -p "$dest_host"
     local stu dest sections
     stu="$(in_repo_path "$stu_host")"
@@ -176,6 +196,11 @@ cmd_rebuild() {
     done
     [ -d "$rootfs_host" ] || die "no such rootfs dir: $rootfs_host"
     [ -f "$stock_host" ]  || die "stock .stu not found: $stock_host (pass --stock)"
+    if case_insensitive_mount && [[ "$(cd "$(dirname "$rootfs_host")" && pwd)/$(basename "$rootfs_host")" == "$REPO"/* ]]; then
+        warn "rebuild is reading a rootfs under the macOS repo mount."
+        warn "If it came from 'unpack', iptables xt modules may be corrupted and WiFi setup (amber/AP) can fail."
+        warn "Prefer: $0 build-ssh ...  OR  scripts/inplace-patch-stu.py for SSH-only."
+    fi
 
     local rootfs out stock newubi
     rootfs="$(in_repo_path "$rootfs_host")"
