@@ -22,6 +22,8 @@
 #include "../include/upnp_soap.h"
 
 #include <inttypes.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -199,6 +201,7 @@ typedef struct upnp_demux_sys
     bool ui_length_set;
     bool volume_sync;
     bool pending_default_volume;
+    bool user_stop;
     int last_volume;
     bool last_mute;
     char display_title[256];
@@ -219,8 +222,27 @@ typedef struct upnp_demux_sys
 #define CAST_EOF_MARGIN   (1 * CLOCK_FREQ)
 #define CAST_MIN_PLAY     (5 * CLOCK_FREQ)
 #define CAST_WAIT_DELAY   (CLOCK_FREQ / 10)
-#define CAST_SEEK_PENDING   (3 * CLOCK_FREQ)
-#define CAST_SEEK_TOLERANCE (2 * CLOCK_FREQ)
+#define CAST_SEEK_PENDING     (3 * CLOCK_FREQ)
+#define CAST_SEEK_TOLERANCE   (2 * CLOCK_FREQ)
+#define UPNP_CAST_SEEK_STOP_US 300000
+#define CAST_DEBUG_LOG        "/tmp/upnp_cast.log"
+
+static void cast_log(const char *fmt, ...)
+{
+    FILE *f = fopen(CAST_DEBUG_LOG, "a");
+
+    if (f == NULL)
+        return;
+
+    va_list ap;
+
+    va_start(ap, fmt);
+    fprintf(f, "%" PRId64 " ", (int64_t)mdate());
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    va_end(ap);
+    fclose(f);
+}
 
 enum {
     CAST_START_OK = VLC_SUCCESS,
@@ -355,9 +377,16 @@ static void stop_remote_playback(upnp_demux_sys_t *sys)
     if (sys == NULL || sys->stop_sent)
         return;
 
+    if (!sys->user_stop && sys->session->casting)
+        return;
+
     if (!sys->track_active && !sys->session->casting && sys->session->httpd == NULL)
         return;
 
+    cast_log("stop_remote_playback track=%d casting=%d user_stop=%d",
+             sys->track_active ? 1 : 0,
+             sys->session->casting ? 1 : 0,
+             sys->user_stop ? 1 : 0);
     clear_display_title(sys);
     upnp_cast_stop(sys->session);
     sys->stop_sent = true;
@@ -378,9 +407,17 @@ static void update_position_from_renderer(upnp_demux_sys_t *sys)
 
     if (sys->seek_until > 0 && mdate() < sys->seek_until)
     {
-        if (have_rel)
+        char state[64];
+        bool playing = false;
+
+        if (upnp_av_get_transport_state(sys->session->device.av_control,
+                                        state, sizeof(state)) == 0)
+            playing = strcmp(state, "PLAYING") == 0;
+
+        if (have_rel && playing)
         {
             int64_t diff = ticks - sys->seek_target;
+
             if (diff < 0)
                 diff = -diff;
             if (diff <= CAST_SEEK_TOLERANCE)
@@ -439,24 +476,23 @@ static bool cast_session_active(upnp_demux_sys_t *sys)
         || (sys->session != NULL && sys->session->casting);
 }
 
-static bool vlc_input_playing(upnp_demux_sys_t *sys)
-{
-    cache_filter_input(sys->demux, sys);
-
-    if (sys->input == NULL)
-        return true;
-
-    return input_GetState(sys->input) == PLAYING_S;
-}
-
 static int seek_reanchor_and_play(demux_t *demux, upnp_demux_sys_t *sys,
-                                  const char *target)
+                                  const char *target, bool want_play)
 {
     upnp_cast_session_t *session = sys->session;
     const char *av_control = session->device.av_control;
 
     if (av_control == NULL || session->media_url[0] == '\0')
         return VLC_EGENERIC;
+
+    /*
+     * Bose SoundTouch only repositions HTTP streams reliably after Stop,
+     * SetAVTransportURI, REL_TIME Seek, then Play. Pause+Seek is ignored.
+     */
+    if (upnp_av_stop(av_control) != 0)
+        cast_log("seek_reanchor stop failed (continuing)");
+
+    usleep(UPNP_CAST_SEEK_STOP_US);
 
     if (upnp_av_set_uri(av_control, session->media_url, sys->display_title,
                         NULL, NULL, sys->length) != 0)
@@ -469,11 +505,31 @@ static int seek_reanchor_and_play(demux_t *demux, upnp_demux_sys_t *sys,
 
     usleep(UPNP_CAST_SETTLE_US);
 
-    if (upnp_av_play(av_control) != 0)
-        return VLC_EGENERIC;
+    if (want_play)
+    {
+        if (upnp_av_play(av_control) != 0)
+            return VLC_EGENERIC;
+    }
 
     msg_Dbg(demux, "UPnP re-anchored cast for seek to %s", target);
     return VLC_SUCCESS;
+}
+
+static void log_renderer_seek_state(const char *tag, const char *av_control)
+{
+    char state[64] = "?";
+    char rel[32] = "?";
+    char dur[32] = "";
+
+    if (av_control != NULL)
+    {
+        upnp_av_get_transport_state(av_control, state, sizeof(state));
+        upnp_av_get_position_info(av_control, rel, sizeof(rel),
+                                  dur, sizeof(dur));
+    }
+
+    cast_log("%s state=%s rel=%s dur=%s", tag, state, rel,
+             dur[0] != '\0' ? dur : "?");
 }
 
 static int ensure_renderer_playing(demux_t *demux, upnp_demux_sys_t *sys,
@@ -494,7 +550,7 @@ static int ensure_renderer_playing(demux_t *demux, upnp_demux_sys_t *sys,
 
     msg_Warn(demux, "UPnP Play after seek to %s failed (state=%s)",
               target, state);
-    return seek_reanchor_and_play(demux, sys, target);
+    return seek_reanchor_and_play(demux, sys, target, true);
 }
 
 static int seek_remote_playback(demux_t *demux, upnp_demux_sys_t *sys,
@@ -507,6 +563,9 @@ static int seek_remote_playback(demux_t *demux, upnp_demux_sys_t *sys,
 
     if (time < 0)
         time = 0;
+
+    ensure_cast_length(demux, sys);
+
     if (sys->length > 0 && time > sys->length)
         time = sys->length;
 
@@ -514,30 +573,23 @@ static int seek_remote_playback(demux_t *demux, upnp_demux_sys_t *sys,
     if (upnp_format_hms_duration(time, target, sizeof(target)) != 0)
         return VLC_EGENERIC;
 
-    bool want_play = vlc_input_playing(sys);
+    bool want_play = !sys->renderer_paused;
 
     sys->seek_target = time;
     sys->seek_until = mdate() + CAST_SEEK_PENDING;
     sys->time = time;
 
-    int ret = VLC_SUCCESS;
+    cast_log("seek_remote_playback target=%s want_play=%d length=%" PRId64,
+             target, want_play ? 1 : 0, (int64_t)sys->length);
+    log_renderer_seek_state("seek_before", av_control);
 
-    if (upnp_av_seek_rel(av_control, target) != 0)
-    {
-        msg_Warn(demux, "UPnP Seek to %s failed, re-anchoring", target);
-        ret = seek_reanchor_and_play(demux, sys, target);
-    }
-    else
-    {
-        usleep(UPNP_CAST_SETTLE_US);
-        ret = ensure_renderer_playing(demux, sys, target, want_play);
-    }
-
-    if (ret != VLC_SUCCESS)
+    if (seek_reanchor_and_play(demux, sys, target, want_play) != VLC_SUCCESS)
     {
         sys->seek_until = 0;
         return VLC_EGENERIC;
     }
+
+    log_renderer_seek_state("seek_after", av_control);
 
     sys->renderer_paused = !want_play;
     sys->seen_playing = want_play;
@@ -861,7 +913,7 @@ static void bind_cast_input(demux_t *demux, upnp_demux_sys_t *sys)
 
 static bool cast_playback_ended(upnp_demux_sys_t *sys, const char *state)
 {
-    if (!sys->renderer_confirmed || !is_ended_state(state))
+    if (!sys->track_active || !sys->renderer_confirmed || !is_ended_state(state))
         return false;
 
     if (cast_seek_pending(sys))
@@ -871,14 +923,49 @@ static bool cast_playback_ended(upnp_demux_sys_t *sys, const char *state)
      && mdate() - sys->play_confirmed_at < CAST_MIN_PLAY)
         return false;
 
-    /* Local file is drained early during cast; rely on remote time/length. */
-    if (sys->length > CAST_EOF_MARGIN)
-        return sys->time + CAST_EOF_MARGIN >= sys->length;
+    /*
+     * Bose often reports STOPPED briefly during Seek. Only treat EOF when the
+     * renderer's own position is near TrackDuration, not from cached sys->time.
+     */
+    if (sys->session->device.av_control != NULL)
+    {
+        char rel[32], dur[32];
 
-    if (sys->track_active && sys->seen_playing)
+        if (upnp_av_get_position_info(sys->session->device.av_control,
+                                      rel, sizeof(rel), dur, sizeof(dur)) == 0)
+        {
+            int64_t rel_ticks = 0, dur_ticks = 0;
+            bool have_rel = upnp_parse_hms_duration(rel, &rel_ticks) == 0;
+            bool have_dur = dur[0] != '\0' && strcmp(dur, "0:00:00") != 0
+                         && upnp_parse_hms_duration(dur, &dur_ticks) == 0
+                         && dur_ticks > 0;
+
+            if (have_dur)
+                sys->length = dur_ticks;
+            if (have_rel)
+                sys->time = rel_ticks;
+
+            if (have_dur && dur_ticks > CAST_EOF_MARGIN)
+            {
+                if (!have_rel || rel_ticks + CAST_EOF_MARGIN < dur_ticks)
+                    return false;
+                cast_log("cast_playback_ended remote rel=%s dur=%s state=%s",
+                         rel, dur, state);
+                return true;
+            }
+        }
+    }
+
+    if (sys->seen_playing)
         return false;
 
-    return sys->local_eof;
+    if (sys->cast_start > 0 && mdate() - sys->cast_start > CAST_PLAY_TIMEOUT)
+    {
+        cast_log("cast_playback_ended startup timeout state=%s", state);
+        return true;
+    }
+
+    return false;
 }
 
 static bool renderer_is_busy(upnp_cast_session_t *session)
@@ -932,6 +1019,13 @@ static int start_cast_uri(demux_t *demux, upnp_demux_sys_t *sys,
     {
         msg_Err(demux, "No media URI for UPnP cast");
         return CAST_START_ERR;
+    }
+
+    if (sys->session->casting && strcmp(sys->session->active_source, source) == 0)
+    {
+        sys->track_active = true;
+        cast_log("start_cast_uri skipped restart for %s", source);
+        return CAST_START_OK;
     }
 
     if (renderer_blocks_new_cast(sys->session, source))
@@ -1022,7 +1116,7 @@ static int poll_renderer_playback(demux_t *demux, upnp_demux_sys_t *sys)
         return VLC_DEMUXER_SUCCESS;
 
     if (cast_seek_pending(sys) && strcmp(state, "PLAYING") != 0
-     && vlc_input_playing(sys))
+     && !sys->renderer_paused)
     {
         char target[32];
         if (upnp_format_hms_duration(sys->seek_target, target, sizeof(target)) == 0)
@@ -1065,6 +1159,7 @@ static int poll_renderer_playback(demux_t *demux, upnp_demux_sys_t *sys)
         msg_Dbg(demux, "UPnP cast track ended (state=%s, time=%" PRId64
                  ", length=%" PRId64 ")", state,
                  (int64_t)sys->time, (int64_t)sys->length);
+        sys->user_stop = false;
         return VLC_DEMUXER_EOF;
     }
 
@@ -1144,6 +1239,7 @@ static void DemuxClose(vlc_object_t *obj)
     upnp_demux_sys_t *sys = (upnp_demux_sys_t *)demux->p_sys;
 
     /* Renderer casts set sout-keep; this is the main stop path for the Bose. */
+    sys->user_stop = true;
     stop_remote_playback(sys);
     detach_volume_sync(sys);
 
@@ -1177,7 +1273,7 @@ static int demux_file_cast(demux_t *demux, upnp_demux_sys_t *sys)
 
     if (!cast_input_active(demux, sys))
     {
-        if (sys->track_active && !cast_seek_pending(sys))
+        if (sys->track_active && !cast_seek_pending(sys) && !sys->session->casting)
             stop_remote_playback(sys);
         msleep(CAST_WAIT_DELAY);
         return VLC_DEMUXER_SUCCESS;
@@ -1217,6 +1313,8 @@ static int demux_file_cast(demux_t *demux, upnp_demux_sys_t *sys)
 
     if (poll_renderer_playback(demux, sys) == VLC_DEMUXER_EOF)
     {
+        cast_log("demux_file_cast EOF time=%" PRId64 " length=%" PRId64,
+                 (int64_t)sys->time, (int64_t)sys->length);
         reset_track_state(sys);
         sys->local_eof = false;
         return VLC_DEMUXER_EOF;
@@ -1264,6 +1362,7 @@ static int DemuxControl(demux_t *demux, int query, va_list args)
             return VLC_SUCCESS;
 
         case DEMUX_FILTER_DISABLE:
+            sys->user_stop = true;
             stop_remote_playback(sys);
             detach_volume_sync(sys);
             sys->enabled = false;
@@ -1392,6 +1491,7 @@ static int DemuxControl(demux_t *demux, int query, va_list args)
                 break;
 
             ensure_cast_length(demux, sys);
+            cast_log("DemuxControl SET_TIME %" PRId64, (int64_t)time);
 
             return seek_remote_playback(demux, sys, time);
         }
@@ -1406,15 +1506,20 @@ static int DemuxControl(demux_t *demux, int query, va_list args)
                 break;
 
             ensure_cast_length(demux, sys);
+            update_position_from_renderer(sys);
             if (sys->length <= 0)
             {
                 msg_Warn(demux, "UPnP seek ignored: unknown track length");
+                cast_log("DemuxControl SET_POSITION %.3f ignored (no length)",
+                         pos);
                 return VLC_EGENERIC;
             }
 
             pos = VLC_CLIP(pos, 0.0, 1.0);
             int64_t time = (int64_t)(pos * (double)sys->length);
 
+            cast_log("DemuxControl SET_POSITION %.3f -> %" PRId64,
+                     pos, (int64_t)time);
             return seek_remote_playback(demux, sys, time);
         }
 

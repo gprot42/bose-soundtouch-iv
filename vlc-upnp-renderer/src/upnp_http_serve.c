@@ -50,23 +50,56 @@ static bool parse_range(const char *req, off_t file_size,
     if (hdr == NULL)
         return false;
 
-    const char *eq = strchr(hdr, '=');
-    if (eq == NULL)
+    const char *bytes = strstr(hdr, "bytes=");
+    if (bytes == NULL)
+        return false;
+
+    if (file_size <= 0)
+        return false;
+
+    char spec[128];
+    const char *spec_in = bytes + 6;
+    size_t speclen = strcspn(spec_in, "\r\n");
+    if (speclen == 0 || speclen >= sizeof(spec))
+        return false;
+    memcpy(spec, spec_in, speclen);
+    spec[speclen] = '\0';
+
+    char *dash = strchr(spec, '-');
+    if (dash == NULL)
         return false;
 
     off_t start = 0;
-    off_t end = file_size > 0 ? file_size - 1 : 0;
+    off_t end = file_size - 1;
 
-    if (strncmp(eq + 1, "bytes=", 6) != 0)
-        return false;
+    if (dash == spec)
+    {
+        long long suffix = 0;
+        if (sscanf(dash + 1, "%lld", &suffix) != 1 || suffix <= 0)
+            return false;
+        start = file_size > suffix ? file_size - suffix : 0;
+    }
+    else
+    {
+        long long start_val = 0;
+        long long end_val = 0;
+        bool has_end = false;
 
-    const char *spec = eq + 7;
-    if (sscanf(spec, "%lld-%lld", (long long *)&start, (long long *)&end) < 1)
-        return false;
+        *dash = '\0';
+        if (sscanf(spec, "%lld", &start_val) != 1 || start_val < 0)
+            return false;
 
-    if (end < start || start < 0)
-        return false;
+        if (dash[1] != '\0' && sscanf(dash + 1, "%lld", &end_val) == 1)
+            has_end = true;
+
+        start = (off_t)start_val;
+        if (has_end && end_val >= 0)
+            end = (off_t)end_val;
+    }
+
     if (start >= file_size)
+        return false;
+    if (end < start)
         return false;
     if (end >= file_size)
         end = file_size - 1;
